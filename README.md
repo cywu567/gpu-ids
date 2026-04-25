@@ -2,8 +2,7 @@
 
 A multi-pattern network packet scanner running on a consumer GPU. Scans pcap captures for known-bad byte signatures, in the style of Snort/Suricata but with the matching engine on a GPU instead of a CPU.
 
-Hackathon weekend: naive brute-force kernel, real throughput numbers vs. a CPU baseline.
-Class project (CS179): PFAC Aho-Corasick kernel **(implemented)** + TCP flow reassembly **(CPU path implemented, GPU path implemented)** + Hyperscan comparison **(implemented)**.
+Three matching engines: naive brute-force GPU kernel, PFAC Aho-Corasick GPU kernel with shared memory DFA cache, and Hyperscan (SIMD CPU) for comparison. Includes TCP flow reassembly to defeat split-payload evasion.
 
 ---
 
@@ -105,7 +104,8 @@ All flags for `benchmark`:
 | `--rules PATH` | Pattern file |
 | `--iters N` | Timing iterations (default 1) |
 | `--csv PATH` | Write results to CSV |
-| `--pfac` | Also time the PFAC Aho-Corasick GPU kernel |
+| `--pfac` | Also time the PFAC Aho-Corasick GPU kernel (shared memory) |
+| `--pfac-baseline` | Also time PFAC with `__ldg` only — compare against shared memory version |
 | `--hyperscan` | Also time Vectorscan (requires `HAVE_HYPERSCAN`) |
 
 ### Run the web UI
@@ -292,6 +292,24 @@ is nothing to "fall back" to. This is the "failureless" property.
 
 Complexity: O(pkt_len) per thread, O(1) in pattern count. Measured throughput ~4 960 MB/s
 vs ~84 MB/s CPU baseline and ~1 490 MB/s Hyperscan (vectorized SIMD CPU matcher).
+
+### PFAC shared memory DFA cache (`pfac_kernel_smem`)
+
+The DFA table for 26 patterns is ~100 KB — larger than the 32 KB read-only L1 cache.
+With `__ldg` alone, every cache miss costs ~200 cycles fetching from global memory.
+
+Fix: at the start of each block, all 256 threads cooperatively load up to 48 KB of DFA
+state rows into shared memory (`extern __shared__ uint16_t s_dfa[]`). Shared memory hits
+in ~4 cycles and cannot be evicted mid-kernel.
+
+- 48 KB / (256 bytes/state × 2 bytes/entry) = **96 states** fit in shared memory.
+- For our 26-pattern rule set the entire DFA fits, so every table lookup hits shared memory.
+- For larger rule sets, states 0–95 (root + first-level trie nodes, the most-traversed)
+  are always hot; deeper states fall back to `__ldg`.
+
+`run_pfac_match_gpu` uses this kernel automatically. The original `__ldg`-only kernel is
+exposed as `run_pfac_match_gpu_baseline` and accessible via `--pfac-baseline` in the
+benchmark for direct comparison.
 
 ---
 

@@ -60,20 +60,22 @@ static void print_row(std::ostream& csv, const std::string& mode, int iter,
 int main(int argc, char** argv) {
     std::string pcap_path, rules_path, csv_path;
     int  iters    = 5;
-    bool run_pfac     = false;
-    bool run_hyperscan = false;
+    bool run_pfac          = false;
+    bool run_pfac_baseline = false;
+    bool run_hyperscan     = false;
 
     for (int i = 1; i < argc; i++) {
-        if (!std::strcmp(argv[i], "--pcap")  && i + 1 < argc) pcap_path  = argv[++i];
-        if (!std::strcmp(argv[i], "--rules") && i + 1 < argc) rules_path = argv[++i];
-        if (!std::strcmp(argv[i], "--csv")   && i + 1 < argc) csv_path   = argv[++i];
-        if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters       = std::stoi(argv[++i]);
-        if (!std::strcmp(argv[i], "--pfac"))       run_pfac      = true;
-        if (!std::strcmp(argv[i], "--hyperscan"))  run_hyperscan = true;
+        if (!std::strcmp(argv[i], "--pcap")          && i + 1 < argc) pcap_path  = argv[++i];
+        if (!std::strcmp(argv[i], "--rules")         && i + 1 < argc) rules_path = argv[++i];
+        if (!std::strcmp(argv[i], "--csv")           && i + 1 < argc) csv_path   = argv[++i];
+        if (!std::strcmp(argv[i], "--iters")         && i + 1 < argc) iters      = std::stoi(argv[++i]);
+        if (!std::strcmp(argv[i], "--pfac"))              run_pfac          = true;
+        if (!std::strcmp(argv[i], "--pfac-baseline"))     run_pfac_baseline = true;
+        if (!std::strcmp(argv[i], "--hyperscan"))         run_hyperscan     = true;
     }
 
     if (pcap_path.empty() || rules_path.empty()) {
-        std::cerr << "Usage: benchmark --pcap PATH --rules PATH [--iters N] [--csv out.csv] [--pfac] [--hyperscan]\n";
+        std::cerr << "Usage: benchmark --pcap PATH --rules PATH [--iters N] [--csv out.csv] [--pfac] [--pfac-baseline] [--hyperscan]\n";
         return 1;
     }
 
@@ -139,6 +141,26 @@ int main(int argc, char** argv) {
             );
             auto t1 = std::chrono::high_resolution_clock::now();
             print_row(csv_file, "gpu_pfac", it, elapsed_ms(t0, t1),
+                      mb / (elapsed_ms(t0, t1) / 1e3));
+        }
+    }
+
+    // -- GPU PFAC baseline (__ldg only, no shared memory) --
+    if (run_pfac_baseline) {
+        std::cout << "\n--- GPU PFAC baseline (__ldg, no shared memory) ---\n";
+
+        PfacDfa dfa = build_pfac_dfa(ps);
+        std::cout << "DFA: " << dfa.num_states << " states, "
+                  << (dfa.num_states * 256 * 2 / 1024) << " KB table\n";
+
+        for (int it = 0; it < iters; it++) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            run_pfac_match_gpu_baseline(
+                pcap.bytes.data(), pcap.offsets.data(), pcap.num_packets,
+                dfa, pfac_hits.data(), ps.num_patterns, pcap.bytes.size()
+            );
+            auto t1 = std::chrono::high_resolution_clock::now();
+            print_row(csv_file, "gpu_pfac_baseline", it, elapsed_ms(t0, t1),
                       mb / (elapsed_ms(t0, t1) / 1e3));
         }
     }

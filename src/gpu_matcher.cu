@@ -288,6 +288,55 @@ __global__ void pfac_kernel_smem(
 }
 
 // ---------------------------------------------------------------------------
+// Host-side launcher: PFAC baseline (__ldg only, no shared memory)
+// ---------------------------------------------------------------------------
+
+void run_pfac_match_gpu_baseline(
+    const uint8_t* h_input,
+    const int*     h_offsets,
+    int            num_packets,
+    const PfacDfa& dfa,
+    uint8_t*       h_hits,
+    int            num_patterns,
+    size_t         input_len
+) {
+    uint8_t*  d_input;
+    int       *d_offsets, *d_accepting;
+    uint16_t* d_dfa_table;
+    uint8_t*  d_hits;
+
+    cudaMalloc(&d_input,     input_len);
+    cudaMalloc(&d_offsets,   (num_packets + 1) * sizeof(int));
+    cudaMalloc(&d_dfa_table, (size_t)dfa.num_states * 256 * sizeof(uint16_t));
+    cudaMalloc(&d_accepting, (size_t)dfa.num_states * sizeof(int));
+    cudaMalloc(&d_hits,      (size_t)num_packets * num_patterns * sizeof(uint8_t));
+
+    cudaMemcpy(d_input,     h_input,              input_len,                                       cudaMemcpyHostToDevice);
+    cudaMemcpy(d_offsets,   h_offsets,            (num_packets + 1) * sizeof(int),                 cudaMemcpyHostToDevice);
+    cudaMemcpy(d_dfa_table, dfa.table.data(),     (size_t)dfa.num_states * 256 * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_accepting, dfa.accepting.data(), (size_t)dfa.num_states * sizeof(int),            cudaMemcpyHostToDevice);
+    cudaMemset(d_hits, 0,   (size_t)num_packets * num_patterns * sizeof(uint8_t));
+
+    const int THREADS = 256;
+    pfac_kernel<<<num_packets, THREADS>>>(
+        d_input, d_offsets, num_packets,
+        d_dfa_table, d_accepting,
+        d_hits, num_patterns
+    );
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_hits, d_hits,
+               (size_t)num_packets * num_patterns * sizeof(uint8_t),
+               cudaMemcpyDeviceToHost);
+
+    cudaFree(d_input);
+    cudaFree(d_offsets);
+    cudaFree(d_dfa_table);
+    cudaFree(d_accepting);
+    cudaFree(d_hits);
+}
+
+// ---------------------------------------------------------------------------
 // Host-side launcher: PFAC kernel (uses shared-memory variant automatically)
 // ---------------------------------------------------------------------------
 
