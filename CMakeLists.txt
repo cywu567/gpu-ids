@@ -9,6 +9,9 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 # Auto-detect the GPU's compute capability on the build machine (same as CS179 lab3).
 set(CMAKE_CUDA_ARCHITECTURES native)
 
+# Device lambdas used in flow_reassembly.cu (Thrust + custom kernels)
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
