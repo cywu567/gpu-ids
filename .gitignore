@@ -1,3 +1,6 @@
 .claude/
 build/
 results/
+data/synthetic_6*.pcap
+data/synthetic_1*.pcap 
+data/synthetic_large*.pcap
