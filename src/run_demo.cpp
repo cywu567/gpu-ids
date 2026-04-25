@@ -7,7 +7,7 @@
  * throughput alongside human-readable IDS alerts.
  *
  * Usage:
- *   ./ids --pcap PATH --rules PATH [--cpu | --gpu | --both]
+ *   ./ids --pcap PATH --rules PATH [--cpu | --gpu | --pfac | --both] [--reassemble]
  *
  * Output:
  *   Loaded N packets (X MB), M patterns
@@ -69,9 +69,25 @@ static int print_alerts(const int* hits, int num_packets, const PatternSet& ps) 
     return total;
 }
 
+static int print_alerts(const uint8_t* hits, int num_packets, const PatternSet& ps) {
+    int total = 0;
+    for (int p = 0; p < num_packets; p++) {
+        for (int r = 0; r < ps.num_patterns; r++) {
+            if (hits[p * ps.num_patterns + r]) {
+                std::cout << RED << "[ALERT]" << RESET
+                          << " packet #" << p
+                          << " | pattern \"" << ps.labels[r] << "\"\n";
+                total++;
+            }
+        }
+    }
+    std::cout << YELLOW << total << " alert(s) total" << RESET << "\n";
+    return total;
+}
+
 int main(int argc, char** argv) {
     std::string pcap_path, rules_path;
-    bool do_cpu = false, do_gpu = false, do_reassemble = false;
+    bool do_cpu = false, do_gpu = false, do_pfac = false, do_reassemble = false;
     bool do_web = false;
     int  web_port = 8080;
 
@@ -80,6 +96,7 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--rules")      && i + 1 < argc) rules_path = argv[++i];
         if (!std::strcmp(argv[i], "--cpu"))        do_cpu = true;
         if (!std::strcmp(argv[i], "--gpu"))        do_gpu = true;
+        if (!std::strcmp(argv[i], "--pfac"))       do_pfac = true;
         if (!std::strcmp(argv[i], "--both"))       { do_cpu = true; do_gpu = true; }
         if (!std::strcmp(argv[i], "--reassemble")) do_reassemble = true;
         if (!std::strcmp(argv[i], "--web")) {
@@ -97,9 +114,9 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (pcap_path.empty() || rules_path.empty() || (!do_cpu && !do_gpu)) {
+    if (pcap_path.empty() || rules_path.empty() || (!do_cpu && !do_gpu && !do_pfac)) {
         std::cerr << "Usage:\n"
-                  << "  ids --pcap PATH --rules PATH [--cpu | --gpu | --both] [--reassemble]\n"
+                  << "  ids --pcap PATH --rules PATH [--cpu | --gpu | --pfac | --both] [--reassemble]\n"
                   << "  ids --web [PORT] [--pcap PATH] [--rules PATH]\n";
         return 1;
     }
@@ -196,7 +213,26 @@ int main(int argc, char** argv) {
 
         std::cout << "=== GPU (naive) results ===\n";
         print_alerts(hits.data(), active.num_packets, ps);
-        std::cout << GREEN << "GPU throughput: " << mbps << " MB/s"
+        std::cout << GREEN << "GPU naive throughput: " << mbps << " MB/s"
+                  << RESET << " (" << ms << " ms)\n\n";
+    }
+
+    // -- GPU PFAC (Aho-Corasick) --
+    if (do_pfac) {
+        PfacDfa dfa = build_pfac_dfa(ps);
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        run_pfac_match_gpu(
+            active.bytes.data(), active.offsets.data(), active.num_packets,
+            dfa, pfac_hits.data(), ps.num_patterns, active.bytes.size()
+        );
+        auto t1  = std::chrono::high_resolution_clock::now();
+        double ms   = elapsed_ms(t0, t1);
+        double mbps = mb / (ms / 1e3);
+
+        std::cout << "=== GPU (PFAC) results ===\n";
+        print_alerts(pfac_hits.data(), active.num_packets, ps);
+        std::cout << GREEN << "GPU PFAC throughput: " << mbps << " MB/s"
                   << RESET << " (" << ms << " ms)\n\n";
     }
 
