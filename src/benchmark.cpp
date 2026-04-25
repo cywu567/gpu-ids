@@ -145,9 +145,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // -- GPU PFAC baseline (__ldg only, no shared memory) --
+    // -- GPU PFAC shared-memory variant --
     if (run_pfac_baseline) {
-        std::cout << "\n--- GPU PFAC baseline (__ldg, no shared memory) ---\n";
+        std::cout << "\n--- GPU PFAC shared-memory variant ---\n";
 
         PfacDfa dfa = build_pfac_dfa(ps);
         std::cout << "DFA: " << dfa.num_states << " states, "
@@ -155,12 +155,12 @@ int main(int argc, char** argv) {
 
         for (int it = 0; it < iters; it++) {
             auto t0 = std::chrono::high_resolution_clock::now();
-            run_pfac_match_gpu_baseline(
+            run_pfac_match_gpu_smem(
                 pcap.bytes.data(), pcap.offsets.data(), pcap.num_packets,
                 dfa, pfac_hits.data(), ps.num_patterns, pcap.bytes.size()
             );
             auto t1 = std::chrono::high_resolution_clock::now();
-            print_row(csv_file, "gpu_pfac_baseline", it, elapsed_ms(t0, t1),
+            print_row(csv_file, "gpu_pfac_smem", it, elapsed_ms(t0, t1),
                       mb / (elapsed_ms(t0, t1) / 1e3));
         }
     }

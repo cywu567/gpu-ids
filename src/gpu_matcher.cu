@@ -288,10 +288,64 @@ __global__ void pfac_kernel_smem(
 }
 
 // ---------------------------------------------------------------------------
-// Host-side launcher: PFAC baseline (__ldg only, no shared memory)
+// Host-side launcher: PFAC shared-memory variant
 // ---------------------------------------------------------------------------
 
-void run_pfac_match_gpu_baseline(
+void run_pfac_match_gpu_smem(
+    const uint8_t* h_input,
+    const int*     h_offsets,
+    int            num_packets,
+    const PfacDfa& dfa,
+    uint8_t*       h_hits,
+    int            num_patterns,
+    size_t         input_len
+) {
+    uint8_t*  d_input;
+    int       *d_offsets, *d_accepting;
+    uint16_t* d_dfa_table;
+    uint8_t*  d_hits;
+
+    cudaMalloc(&d_input,     input_len);
+    cudaMalloc(&d_offsets,   (num_packets + 1) * sizeof(int));
+    cudaMalloc(&d_dfa_table, (size_t)dfa.num_states * 256 * sizeof(uint16_t));
+    cudaMalloc(&d_accepting, (size_t)dfa.num_states * sizeof(int));
+    cudaMalloc(&d_hits,      (size_t)num_packets * num_patterns * sizeof(uint8_t));
+
+    cudaMemcpy(d_input,     h_input,              input_len,                                       cudaMemcpyHostToDevice);
+    cudaMemcpy(d_offsets,   h_offsets,            (num_packets + 1) * sizeof(int),                 cudaMemcpyHostToDevice);
+    cudaMemcpy(d_dfa_table, dfa.table.data(),     (size_t)dfa.num_states * 256 * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_accepting, dfa.accepting.data(), (size_t)dfa.num_states * sizeof(int),            cudaMemcpyHostToDevice);
+    cudaMemset(d_hits, 0,   (size_t)num_packets * num_patterns * sizeof(uint8_t));
+
+    const int THREADS    = 256;
+    // Fit as many DFA rows as possible into 48 KB of shared memory.
+    const int SMEM_BYTES = 48 * 1024;
+    int smem_states      = std::min(dfa.num_states, SMEM_BYTES / (256 * (int)sizeof(uint16_t)));
+    size_t smem_size     = (size_t)smem_states * 256 * sizeof(uint16_t);
+
+    pfac_kernel_smem<<<num_packets, THREADS, smem_size>>>(
+        d_input, d_offsets, num_packets,
+        d_dfa_table, d_accepting,
+        d_hits, num_patterns, smem_states
+    );
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_hits, d_hits,
+               (size_t)num_packets * num_patterns * sizeof(uint8_t),
+               cudaMemcpyDeviceToHost);
+
+    cudaFree(d_input);
+    cudaFree(d_offsets);
+    cudaFree(d_dfa_table);
+    cudaFree(d_accepting);
+    cudaFree(d_hits);
+}
+
+// ---------------------------------------------------------------------------
+// Host-side launcher: PFAC kernel
+// ---------------------------------------------------------------------------
+
+void run_pfac_match_gpu(
     const uint8_t* h_input,
     const int*     h_offsets,
     int            num_packets,
@@ -322,67 +376,6 @@ void run_pfac_match_gpu_baseline(
         d_input, d_offsets, num_packets,
         d_dfa_table, d_accepting,
         d_hits, num_patterns
-    );
-    cudaDeviceSynchronize();
-
-    cudaMemcpy(h_hits, d_hits,
-               (size_t)num_packets * num_patterns * sizeof(uint8_t),
-               cudaMemcpyDeviceToHost);
-
-    cudaFree(d_input);
-    cudaFree(d_offsets);
-    cudaFree(d_dfa_table);
-    cudaFree(d_accepting);
-    cudaFree(d_hits);
-}
-
-// ---------------------------------------------------------------------------
-// Host-side launcher: PFAC kernel (uses shared-memory variant automatically)
-// ---------------------------------------------------------------------------
-
-void run_pfac_match_gpu(
-    const uint8_t* h_input,
-    const int*     h_offsets,
-    int            num_packets,
-    const PfacDfa& dfa,
-    uint8_t*       h_hits,
-    int            num_patterns,
-    size_t         input_len
-) {
-    uint8_t*  d_input;
-    int       *d_offsets, *d_accepting;
-    uint16_t* d_dfa_table;
-    uint8_t*  d_hits;
-
-    cudaMalloc(&d_input,     input_len);
-    cudaMalloc(&d_offsets,   (num_packets + 1) * sizeof(int));
-    cudaMalloc(&d_dfa_table, (size_t)dfa.num_states * 256 * sizeof(uint16_t));
-    cudaMalloc(&d_accepting, (size_t)dfa.num_states * sizeof(int));
-    cudaMalloc(&d_hits,      (size_t)num_packets * num_patterns * sizeof(uint8_t));
-
-    cudaMemcpy(d_input,     h_input,              input_len,                                       cudaMemcpyHostToDevice);
-    cudaMemcpy(d_offsets,   h_offsets,            (num_packets + 1) * sizeof(int),                 cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dfa_table, dfa.table.data(),     (size_t)dfa.num_states * 256 * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_accepting, dfa.accepting.data(), (size_t)dfa.num_states * sizeof(int),            cudaMemcpyHostToDevice);
-    cudaMemset(d_hits, 0,   (size_t)num_packets * num_patterns * sizeof(uint8_t));
-
-    const int THREADS = 256;
-
-    // Fit as many DFA state rows as possible into 48 KB of shared memory.
-    // Each row is 256 uint16_t = 512 bytes.  96 rows = 49152 B = 48 KB.
-    // If the entire DFA fits, every table lookup hits shared memory.
-    // If not, the most-traversed states (root + early trie nodes, indices 0-95)
-    // are cached; deep states that appear only at the tail of long matches fall
-    // back to __ldg.
-    const int SMEM_LIMIT = 48 * 1024;
-    int smem_states = std::min(dfa.num_states,
-                               SMEM_LIMIT / (256 * (int)sizeof(uint16_t)));
-    size_t smem_bytes = (size_t)smem_states * 256 * sizeof(uint16_t);
-
-    pfac_kernel_smem<<<num_packets, THREADS, smem_bytes>>>(
-        d_input, d_offsets, num_packets,
-        d_dfa_table, d_accepting,
-        d_hits, num_patterns, smem_states
     );
     cudaDeviceSynchronize();
 
