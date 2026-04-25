@@ -36,6 +36,7 @@
 #include "web_server.h"
 #include <chrono>
 #include <cstring>
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -227,6 +228,20 @@ int main(int argc, char** argv) {
         FlowGrouping groups = group_flows_by_5tuple(pcap);
         std::vector<FlowStatResult> fstats;
         run_flow_stats_gpu(pcap, groups, fstats);
+
+        // Debug: print top 15 flows by packet count                                                    
+        std::sort(fstats.begin(), fstats.end(), [](const auto& a, const auto& b){
+            return a.packet_count > b.packet_count;                              
+        });                                                                                             
+        for (int i = 0; i < std::min(15, (int)fstats.size()); i++) {
+            const auto& f = fstats[i];                                                                  
+            printf("  %u.%u.%u.%u → %u.%u.%u.%u:%u  pkts=%d  iat_cv=%.4f  iat_mean=%.1fms\n",           
+                (f.tuple.src_ip>>24)&0xFF, (f.tuple.src_ip>>16)&0xFF,                        
+                (f.tuple.src_ip>>8)&0xFF,   f.tuple.src_ip&0xFF,                                        
+                (f.tuple.dst_ip>>24)&0xFF, (f.tuple.dst_ip>>16)&0xFF,                                   
+                (f.tuple.dst_ip>>8)&0xFF,   f.tuple.dst_ip&0xFF,                                        
+                f.tuple.dport, f.packet_count, f.iat_cv, f.iat_mean_ms);                                
+        }   
         auto t1 = std::chrono::high_resolution_clock::now();
 
         int beacon_count = 0;
