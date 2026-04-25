@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/gen_synthetic.dir/src/gen_synthetic.cpp.o -o gen_synthetic  -Wl,-rpath,/home/cywu/miniconda3/envs/gpu-ids/lib /home/cywu/miniconda3/envs/gpu-ids/lib/libpcap.so
