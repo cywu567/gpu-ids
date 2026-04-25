@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(curl -fsSL \"https://raw.githubusercontent.com/yhirose/cpp-httplib/master/httplib.h\" -o /Users/celinewu/Desktop/Caltech/HackTech/gpu-ids/src/httplib.h)"
-    ]
-  }
-}
