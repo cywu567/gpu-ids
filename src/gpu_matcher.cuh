@@ -91,11 +91,11 @@ struct PfacDfa {
 PfacDfa build_pfac_dfa(const PatternSet& ps);
 
 /**
- * PFAC baseline: uses __ldg read-only cache only (no shared memory).
- * Kept for head-to-head comparison against run_pfac_match_gpu in the benchmark.
- * Use --pfac-baseline in the benchmark binary.
+ * PFAC shared-memory variant: loads the first smem_states DFA rows into
+ * shared memory at block startup for ~4-cycle access vs ~200-cycle global.
+ * Use run_pfac_match_gpu for the default __ldg path.
  */
-void run_pfac_match_gpu_baseline(
+void run_pfac_match_gpu_smem(
     const uint8_t* h_input,
     const int*     h_offsets,
     int            num_packets,

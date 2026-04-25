@@ -307,8 +307,8 @@ in ~4 cycles and cannot be evicted mid-kernel.
 - For larger rule sets, states 0–95 (root + first-level trie nodes, the most-traversed)
   are always hot; deeper states fall back to `__ldg`.
 
-`run_pfac_match_gpu` uses this kernel automatically. The original `__ldg`-only kernel is
-exposed as `run_pfac_match_gpu_baseline` and accessible via `--pfac-baseline` in the
+`run_pfac_match_gpu` uses the `__ldg`-only kernel (default). The shared-memory variant is
+exposed as `run_pfac_match_gpu_smem` and accessible via `--pfac-baseline` in the
 benchmark for direct comparison.
 
 ---
