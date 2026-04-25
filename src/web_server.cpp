@@ -326,7 +326,7 @@ static const char* DASHBOARD_HTML = R"html(<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GPU-IDS Dashboard</title>
+<title>CudaShield</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -417,7 +417,7 @@ static const char* DASHBOARD_HTML = R"html(<!DOCTYPE html>
 </head>
 <body>
 
-<h1>&#x26a1; GPU Intrusion Detection System</h1>
+<h1>&#x26a1; CudaShield</h1>
 <p class="subtitle">GPU PFAC (Aho-Corasick) vs Hyperscan (SIMD CPU) vs naive CPU</p>
 
 <div class="card">

@@ -3,7 +3,7 @@
 A multi-pattern network packet scanner running on a consumer GPU. Scans pcap captures for known-bad byte signatures, in the style of Snort/Suricata but with the matching engine on a GPU instead of a CPU.
 
 Hackathon weekend: naive brute-force kernel, real throughput numbers vs. a CPU baseline.
-Class project (CS179): PFAC Aho-Corasick kernel **(implemented)** + TCP flow reassembly + Hyperscan comparison.
+Class project (CS179): PFAC Aho-Corasick kernel **(implemented)** + TCP flow reassembly **(CPU path implemented, GPU path implemented)** + Hyperscan comparison **(implemented)**.
 
 ---
 
@@ -37,12 +37,11 @@ macOS has no NVIDIA GPU -- use [Google Colab](https://colab.research.google.com/
 **CMake (with conda env active)**
 ```bash
 conda activate gpu-ids
-cd gpu-ids
-cmake -B build -DCMAKE_PREFIX_PATH=$CONDA_PREFIX   # lets CMake find conda's libpcap
+cmake -B build -DCMAKE_PREFIX_PATH=$CONDA_PREFIX   # lets CMake find conda's libpcap + vectorscan
 cmake --build build -j$(nproc)
 ```
 
-Binaries land in `build/` either way.
+Binaries land in `build/`: `ids`, `benchmark`, `gen_synthetic`.
 
 ### Generate a synthetic test pcap
 
@@ -56,8 +55,25 @@ Then update `src/gen_synthetic.cpp` malicious payload strings to match your fina
 ### Run the demo
 
 ```bash
-./build/ids --pcap data/synthetic.pcap --rules patterns/rules.txt --both
+# CPU only
+./build/ids --pcap data/demo.pcap --rules patterns/rules.txt --cpu
+
+# GPU naive kernel (one thread per packet×pattern)
+./build/ids --pcap data/demo.pcap --rules patterns/rules.txt --gpu
+
+# GPU PFAC Aho-Corasick kernel (one thread per start byte, single DFA)
+./build/ids --pcap data/demo.pcap --rules patterns/rules.txt --pfac
+
+# CPU + GPU naive side by side
+./build/ids --pcap data/demo.pcap --rules patterns/rules.txt --both
+
+# TCP reassembly then PFAC match (defeats split-payload evasion)
+./build/ids --pcap data/demo.pcap --rules patterns/rules.txt --pfac --reassemble
 ```
+
+`--gpu` uses the **naive** brute-force kernel (limited to 1 024 patterns).
+`--pfac` uses the **PFAC Aho-Corasick** kernel — no pattern limit, ~4 960 MB/s.
+`--reassemble` parses Ethernet/IP/TCP headers and stitches TCP streams before matching.
 
 ### Run benchmarks
 
@@ -66,16 +82,31 @@ Then update `src/gen_synthetic.cpp` malicious payload strings to match your fina
 ./build/benchmark \
     --pcap  data/demo.pcap \
     --rules patterns/rules.txt \
-    --iters 5 \
-    --csv   results/benchmark.csv
+    --iters 5
 
-# Add --pfac to also time the Aho-Corasick kernel
+# Add --pfac to also time the PFAC Aho-Corasick kernel
 ./build/benchmark \
     --pcap  data/demo.pcap \
     --rules patterns/rules.txt \
-    --iters 5 --pfac \
-    --csv   results/benchmark_pfac.csv
+    --iters 5 --pfac
+
+# Add --hyperscan to also time Vectorscan (Hyperscan fork)
+./build/benchmark \
+    --pcap  data/demo.pcap \
+    --rules patterns/rules.txt \
+    --iters 5 --pfac --hyperscan
 ```
+
+All flags for `benchmark`:
+
+| Flag | Description |
+|------|-------------|
+| `--pcap PATH` | Input pcap file |
+| `--rules PATH` | Pattern file |
+| `--iters N` | Timing iterations (default 1) |
+| `--csv PATH` | Write results to CSV |
+| `--pfac` | Also time the PFAC Aho-Corasick GPU kernel |
+| `--hyperscan` | Also time Vectorscan (requires `HAVE_HYPERSCAN`) |
 
 ### Run the web UI
 
@@ -85,13 +116,16 @@ Start the server on the remote machine (default port 8080):
 ./build/ids --web 8080 --pcap data/demo.pcap --rules patterns/rules.txt
 ```
 
+The dashboard shows three bars: CPU (yellow), GPU PFAC (green), Hyperscan (purple),
+and a live speedup ratio.
+
 Then, in a **separate terminal on your laptop**, forward the port:
 
 ```bash
 ssh -L 8080:localhost:8080 user@remote-machine
 ```
 
-Open [http://localhost:8080](http://localhost:8080) in your browser. The page shows live match results and throughput stats without needing a public IP.
+Open [http://localhost:8080](http://localhost:8080) in your browser.
 
 ---
 
@@ -99,25 +133,26 @@ Open [http://localhost:8080](http://localhost:8080) in your browser. The page sh
 
 ```
 gpu-ids/
-├── CMakeLists.txt          build config
-├── environment.yml         conda env (libpcap + cmake, no sudo needed)
+├── CMakeLists.txt              build config
+├── environment.yml             conda env (libpcap + vectorscan, no sudo needed)
 ├── data/
-│   ├── demo.pcap           large synthetic pcap for benchmarking
-│   └── synthetic.pcap      small synthetic pcap (quick smoke test)
+│   └── demo.pcap               pcap for benchmarking
 ├── patterns/
-│   └── rules.txt           one pattern per line; '#' = comment
-├── src/
-│   ├── load_pcap.cpp/h     libpcap loader → flat buffer + offsets
-│   ├── cpu_matcher.cpp/h   reference CPU matcher (memmem baseline)
-│   ├── gpu_matcher.cu/cuh  naive kernel + PFAC Aho-Corasick kernel
-│   ├── flow_reassembly.cu/cuh  TCP stream reassembly (Week 3 stub)
-│   ├── benchmark.cpp       timed CPU vs GPU naive vs GPU PFAC, writes CSV
-│   ├── gen_synthetic.cpp   builds synthetic pcap with known hits
-│   └── run_demo.cpp        CLI + web server entry point
-└── results/
-    ├── benchmark.csv       raw throughput numbers
-    ├── speedup_chart.png   plotted from CSV
-    └── notes.md            hardware specs + run conditions
+│   └── rules.txt               one pattern per line; '#' = comment
+└── src/
+    ├── load_pcap.cpp/h         libpcap loader → flat byte buffer + packet offsets
+    ├── cpu_matcher.cpp/h       reference CPU matcher (memmem baseline ~84 MB/s)
+    ├── gpu_matcher.cu/cuh      naive kernel + PFAC Aho-Corasick kernel
+    │                             naive: one thread per (packet, pattern)
+    │                             PFAC:  uint16_t DFA, uint8_t hits, ~4 960 MB/s
+    ├── flow_reassembly.cu/cuh  TCP stream reassembly
+    │                             CPU:  unordered_map flow table, gap buffering
+    │                             GPU:  atomicCAS hash table + thrust prefix-sum
+    ├── benchmark.cpp           timed runs; writes CSV
+    ├── gen_synthetic.cpp       builds synthetic pcap with known hits
+    ├── run_demo.cpp            CLI entry point (ids binary)
+    ├── web_server.cpp/h        HTTP dashboard on port 8080
+    └── httplib.h               single-header HTTP server library
 ```
 
 ---
@@ -137,6 +172,63 @@ The naive GPU kernel is limited to 1024 patterns (CUDA max-threads-per-block). U
 
 ---
 
+## How the kernels work
+
+### Naive kernel
+
+Grid: one block per packet, one thread per pattern (`blockIdx.x` = packet, `threadIdx.x` = pattern).
+Each thread does a brute-force sliding-window search for its single pattern in its packet.
+Complexity: O(pkt_len × pat_len) per thread. Hard cap of 1 024 patterns (CUDA max threads/block).
+
+### PFAC kernel (Parallel Failureless Aho-Corasick)
+
+All patterns are compiled offline into a single DFA (trie with no failure links):
+- State 0 = dead, state 1 = root.
+- `table[state * 256 + byte]` gives the next state.
+- Accepting states record which pattern matched.
+- Stored as `uint16_t` to cut table size in half (~140 KB for 26 patterns).
+
+At scan time: one block per packet, 256 threads per block.
+Each thread owns start positions `threadIdx.x, threadIdx.x+256, ...` within the packet.
+Every thread walks the DFA forward from root at its start byte until hitting dead state 0.
+
+Because every byte position gets a fresh start, no failure links are needed at runtime — there
+is nothing to "fall back" to. This is the "failureless" property.
+
+Complexity: O(pkt_len) per thread, O(1) in pattern count. Measured throughput ~4 960 MB/s
+vs ~84 MB/s CPU baseline and ~1 490 MB/s Hyperscan (vectorized SIMD CPU matcher).
+
+---
+
+## TCP flow reassembly
+
+An attacker can split a malicious payload across multiple TCP segments, each individually
+innocent. Without reassembly the matcher misses the pattern; with reassembly it sees the
+complete application stream.
+
+### CPU path (`reassemble_segment`)
+
+- Flow table: `std::unordered_map<FlowKey, FlowBuffer>` keyed by 5-tuple.
+- In-order segments are appended immediately; out-of-order segments are stashed in a
+  `std::map<uint32_t, bytes>` gap buffer keyed by sequence number.
+- When stashed segments become consecutive they are drained into the main buffer automatically.
+- On FIN or RST the completed stream is returned as a flat `std::vector<uint8_t>` and the
+  flow entry is removed.
+
+### GPU path (`flow_insert_kernel` + `mark_complete_kernel` + `compact_flows_kernel`)
+
+- Open-addressing hash table (`GpuFlowSlot[]`) lives on device.
+- One warp per segment: lane 0 drives `atomicCAS` linear probing to claim/find the flow's
+  slot; all 32 lanes cooperate to copy the payload at `buf_offset + (seq - init_seq)`,
+  which handles both in-order and out-of-order segments without CPU-side synchronization.
+- `mark_complete_kernel` flags slots where `fin_seen == 1`.
+- `compact_flows_kernel` uses `thrust::exclusive_scan` prefix-sum offsets to scatter
+  finished flows into a contiguous buffer fed directly into `run_pfac_match_gpu`.
+- Each flow's payload buffer is pre-allocated at a fixed `MAX_FLOW_BYTES`; flows exceeding
+  this are truncated.
+
+---
+
 ## Demo script (90 seconds)
 
 1. "IDS systems check every packet against thousands of patterns. CPUs struggle at high speed. Enterprises pay $50k for FPGA appliances. We did it on a consumer GPU."
@@ -144,18 +236,9 @@ The naive GPU kernel is limited to 1024 patterns (CUDA max-threads-per-block). U
 3. CPU: `./build/ids --pcap data/demo.pcap --rules patterns/rules.txt --cpu`
 4. GPU naive: `./build/ids --pcap data/demo.pcap --rules patterns/rules.txt --gpu`
 5. "Same alerts, Nx faster. That's the naive kernel -- one thread per (packet, pattern) pair."
-6. Benchmark all three: `./build/benchmark --pcap data/demo.pcap --rules patterns/rules.txt --iters 3 --pfac`
-7. "PFAC Aho-Corasick compiles all patterns into a single DFA -- one thread per start byte, O(packet_length) regardless of pattern count. The class project adds TCP flow reassembly on top."
-
----
-
-## CS179 deliverables
-
-| Deadline | Deliverable |
-|----------|-------------|
-| May 6    | Proposal PDF → sfoxman@caltech.edu, subject "CS179 Project Proposal" |
-| May 27   | CPU demo (hackathon code cleaned up) |
-| June 5 / June 12 | Final: full code + README + performance analysis |
+6. Benchmark all three: `./build/benchmark --pcap data/demo.pcap --rules patterns/rules.txt --iters 3 --pfac --hyperscan`
+7. "PFAC Aho-Corasick compiles all patterns into a single DFA -- one thread per start byte, O(packet_length) regardless of pattern count. ~5 GB/s vs Hyperscan's ~1.5 GB/s."
+8. "We also implemented TCP flow reassembly so split-payload evasion attacks don't fool us."
 
 ---
 
@@ -164,5 +247,5 @@ The naive GPU kernel is limited to 1024 patterns (CUDA max-threads-per-block). U
 - Aho & Corasick (1975). *Efficient string matching.* CACM.
 - Lin, Liu, Chang (2013). *Accelerating Pattern Matching Using a Novel Parallel Algorithm on GPUs.* IEEE Trans. Computers. **(primary kernel reference)**
 - [PFAC reference implementation](https://github.com/pfac-lib/PFAC)
-- [Hyperscan](https://www.hyperscan.io/) -- the CPU baseline we benchmark against in Week 4
+- [Hyperscan](https://www.hyperscan.io/) / [Vectorscan](https://github.com/VectorCamp/vectorscan) -- SIMD multi-pattern CPU matcher; our GPU PFAC runs ~3.3× faster
 - [malware-traffic-analysis.net](https://malware-traffic-analysis.net/) -- real malware pcap source
