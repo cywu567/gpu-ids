@@ -149,16 +149,6 @@ The naive GPU kernel is limited to 1024 patterns (CUDA max-threads-per-block). U
 
 ---
 
-## CS179 deliverables
-
-| Deadline | Deliverable |
-|----------|-------------|
-| May 6    | Proposal PDF → sfoxman@caltech.edu, subject "CS179 Project Proposal" |
-| May 27   | CPU demo (hackathon code cleaned up) |
-| June 5 / June 12 | Final: full code + README + performance analysis |
-
----
-
 ## References
 
 - Aho & Corasick (1975). *Efficient string matching.* CACM.
