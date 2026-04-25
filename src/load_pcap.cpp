@@ -33,6 +33,8 @@ void packet_handler(u_char* user, const pcap_pkthdr* hdr, const u_char* data) {
     PcapData* d = ctx->out;
 
     d->offsets.push_back(static_cast<int>(d->bytes.size()));
+    d->timestamps_us.push_back(
+        (uint64_t)hdr->ts.tv_sec * 1000000ULL + (uint64_t)hdr->ts.tv_usec);
     d->bytes.insert(d->bytes.end(), data, data + hdr->caplen);
     d->num_packets++;
 }

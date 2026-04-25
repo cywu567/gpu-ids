@@ -21,6 +21,7 @@
 #include "httplib.h"
 
 #include "cpu_matcher.h"
+#include "flow_stats.cuh"
 #include "gpu_matcher.cuh"
 #include "load_pcap.h"
 #include "web_server.h"
@@ -61,7 +62,8 @@ struct ScanStatus {
     bool        hs_done     = false;
     double      hs_ms       = 0;
     double      hs_mbps     = 0;
-    std::vector<Alert> alerts;
+    std::vector<Alert>          alerts;
+    std::vector<FlowStatResult> flow_stats;
 };
 
 static std::mutex  g_mu;
@@ -129,6 +131,30 @@ static std::string status_to_json() {
           << ",\"pattern\":\"" << json_esc(a.pattern) << "\"}";
         first = false;
     }
+    o << "],\n  \"suspicious_flows\":[";
+
+    first = true;
+    for (const auto& f : g_status.flow_stats) {
+        if (!f.is_beacon) continue;
+        if (!first) o << ",";
+        char src_buf[18], dst_buf[18];
+        std::snprintf(src_buf, sizeof(src_buf), "%u.%u.%u.%u",
+            (f.tuple.src_ip>>24)&0xFF, (f.tuple.src_ip>>16)&0xFF,
+            (f.tuple.src_ip>> 8)&0xFF,  f.tuple.src_ip     &0xFF);
+        std::snprintf(dst_buf, sizeof(dst_buf), "%u.%u.%u.%u",
+            (f.tuple.dst_ip>>24)&0xFF, (f.tuple.dst_ip>>16)&0xFF,
+            (f.tuple.dst_ip>> 8)&0xFF,  f.tuple.dst_ip     &0xFF);
+        o << "{\"src\":\"" << src_buf << "\""
+          << ",\"dst\":\"" << dst_buf << "\""
+          << ",\"sport\":" << f.tuple.sport
+          << ",\"dport\":" << f.tuple.dport
+          << ",\"packets\":" << f.packet_count
+          << ",\"iat_mean_ms\":" << f.iat_mean_ms
+          << ",\"iat_cv\":" << f.iat_cv
+          << ",\"size_mean\":" << f.size_mean
+          << "}";
+        first = false;
+    }
     o << "]\n}";
     return o.str();
 }
@@ -182,6 +208,14 @@ static std::string do_scan(const std::string& pcap_path,
             std::lock_guard<std::mutex> lk(g_mu);
             g_status.num_packets  = pcap.num_packets;
             g_status.num_patterns = ps.num_patterns;
+        }
+
+        {
+            FlowGrouping groups = group_flows_by_5tuple(pcap);
+            std::vector<FlowStatResult> fstats;
+            run_flow_stats_gpu(pcap, groups, fstats);
+            std::lock_guard<std::mutex> lk(g_mu);
+            g_status.flow_stats = std::move(fstats);
         }
 
         std::vector<int>     hits(pcap.num_packets * ps.num_patterns, 0);
@@ -411,8 +445,14 @@ static const char* DASHBOARD_HTML = R"html(<!DOCTYPE html>
   tr.alert-row td { color: #f85149; }
   tr.alert-row:hover td { background: #1f2937; }
 
+  tr.beacon-row td { color: #f85149; }
+  tr.beacon-row:hover td { background: #1f2937; }
+  .iat-cv-low  { color: #f85149; font-weight: bold; }
+  .iat-cv-ok   { color: #3fb950; }
+
   #results-section { display: none; }
   #alerts-section  { display: none; }
+  #flows-section   { display: none; }
 </style>
 </head>
 <body>
@@ -493,6 +533,17 @@ static const char* DASHBOARD_HTML = R"html(<!DOCTYPE html>
   </table>
 </div>
 
+<div class="card" id="flows-section">
+  <h2>Suspicious Flows &mdash; <span id="flow-count" style="color:#f85149">0</span> beacon(s)</h2>
+  <table>
+    <thead><tr>
+      <th>#</th><th>Src</th><th>Dst</th><th>Port</th>
+      <th>Pkts</th><th>IAT mean</th><th>IAT CV</th><th>Size mean</th>
+    </tr></thead>
+    <tbody id="flow-tbody"></tbody>
+  </table>
+</div>
+
 <script>
 const defaults = {pcap: '', rules: ''};
 
@@ -519,6 +570,7 @@ async function startScan() {
   document.getElementById('scan-btn').disabled = true;
   document.getElementById('results-section').style.display = 'none';
   document.getElementById('alerts-section').style.display  = 'none';
+  document.getElementById('flows-section').style.display   = 'none';
   setStatus('Scanning…', 'scanning');
 
   try {
@@ -600,6 +652,29 @@ function renderResults(d) {
       tr.className = 'alert-row';
       tr.innerHTML = `<td>${i+1}</td><td>#${a.packet}</td><td>${esc(a.pattern)}</td>`;
       tbody.appendChild(tr);
+    });
+  }
+
+  const flows = d.suspicious_flows || [];
+  if (flows.length > 0) {
+    document.getElementById('flows-section').style.display = 'block';
+    document.getElementById('flow-count').textContent = flows.length;
+    const ftbody = document.getElementById('flow-tbody');
+    ftbody.innerHTML = '';
+    flows.forEach((f, i) => {
+      const cv     = f.iat_cv.toFixed(3);
+      const cvCls  = f.iat_cv < 0.05 ? 'iat-cv-low' : 'iat-cv-ok';
+      const iatMs  = f.iat_mean_ms >= 1000
+                   ? (f.iat_mean_ms/1000).toFixed(1) + ' s'
+                   : f.iat_mean_ms.toFixed(0) + ' ms';
+      const tr = document.createElement('tr');
+      tr.className = 'beacon-row';
+      tr.innerHTML = `<td>${i+1}</td><td>${esc(f.src)}</td><td>${esc(f.dst)}</td>`
+                   + `<td>${f.dport}</td><td>${f.packets}</td>`
+                   + `<td>${iatMs}</td>`
+                   + `<td><span class="${cvCls}">${cv}</span></td>`
+                   + `<td>${f.size_mean.toFixed(0)} B</td>`;
+      ftbody.appendChild(tr);
     });
   }
 }

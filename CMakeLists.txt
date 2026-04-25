@@ -68,3 +68,9 @@ target_link_libraries(gen_synthetic ${PCAP_LIB})
 # ---------------------------------------------------------------------------
 target_sources(ids       PRIVATE src/flow_reassembly.cu)
 target_sources(benchmark PRIVATE src/flow_reassembly.cu)
+
+# ---------------------------------------------------------------------------
+# Extension: flow statistics / beacon detection
+# ---------------------------------------------------------------------------
+target_sources(ids       PRIVATE src/flow_stats.cu)
+target_sources(benchmark PRIVATE src/flow_stats.cu)
