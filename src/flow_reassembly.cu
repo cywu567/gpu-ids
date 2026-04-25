@@ -159,8 +159,10 @@ FlowBuffer* reassemble_segment(
     buf.key = key;
 
     if (!buf.seq_initialized) {
-        buf.next_seq        = seq;
         buf.seq_initialized = true;
+        // SYN/ACK packets have len==0 but consume one sequence number.
+        // Set next_seq past it so the first data segment is seen as in-order.
+        buf.next_seq = (len == 0) ? seq + 1 : seq;
     }
 
     if (len > 0) {

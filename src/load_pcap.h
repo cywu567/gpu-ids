@@ -25,7 +25,7 @@ struct PcapData {
     std::vector<uint8_t>  bytes;         // flat concatenated packet bytes (all packets back-to-back)
     std::vector<int>      offsets;       // offsets[i] = start of packet i; offsets[num_packets] = total size
     std::vector<uint64_t> timestamps_us; // epoch microseconds per packet; same indexing as offsets
-    int                   num_packets;
+    int                   num_packets = 0;
 };
 
 /**
