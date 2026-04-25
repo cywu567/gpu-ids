@@ -4,7 +4,7 @@
 /**
  * Start the web dashboard HTTP server.
  *
- * Serves a live dashboard at http://localhost:PORT that lets users:
+ * Serves a live dashboard at http://cudashield.tech:PORT that lets users:
  *   - Enter a pcap path and rules path
  *   - Choose CPU / GPU / both
  *   - Trigger a scan and see alerts + throughput comparison
