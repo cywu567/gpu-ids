@@ -29,6 +29,7 @@
  */
 
 #include "cpu_matcher.h"
+#include "flow_reassembly.cuh"
 #include "gpu_matcher.cuh"
 #include "load_pcap.h"
 #include "web_server.h"
@@ -70,16 +71,17 @@ static int print_alerts(const int* hits, int num_packets, const PatternSet& ps) 
 
 int main(int argc, char** argv) {
     std::string pcap_path, rules_path;
-    bool do_cpu = false, do_gpu = false;
+    bool do_cpu = false, do_gpu = false, do_reassemble = false;
     bool do_web = false;
     int  web_port = 8080;
 
     for (int i = 1; i < argc; i++) {
-        if (!std::strcmp(argv[i], "--pcap")  && i + 1 < argc) pcap_path  = argv[++i];
-        if (!std::strcmp(argv[i], "--rules") && i + 1 < argc) rules_path = argv[++i];
-        if (!std::strcmp(argv[i], "--cpu"))  do_cpu = true;
-        if (!std::strcmp(argv[i], "--gpu"))  do_gpu = true;
-        if (!std::strcmp(argv[i], "--both")) { do_cpu = true; do_gpu = true; }
+        if (!std::strcmp(argv[i], "--pcap")       && i + 1 < argc) pcap_path  = argv[++i];
+        if (!std::strcmp(argv[i], "--rules")      && i + 1 < argc) rules_path = argv[++i];
+        if (!std::strcmp(argv[i], "--cpu"))        do_cpu = true;
+        if (!std::strcmp(argv[i], "--gpu"))        do_gpu = true;
+        if (!std::strcmp(argv[i], "--both"))       { do_cpu = true; do_gpu = true; }
+        if (!std::strcmp(argv[i], "--reassemble")) do_reassemble = true;
         if (!std::strcmp(argv[i], "--web")) {
             do_web = true;
             if (i + 1 < argc && std::isdigit((unsigned char)argv[i + 1][0]))
@@ -97,16 +99,59 @@ int main(int argc, char** argv) {
 
     if (pcap_path.empty() || rules_path.empty() || (!do_cpu && !do_gpu)) {
         std::cerr << "Usage:\n"
-                  << "  ids --pcap PATH --rules PATH [--cpu | --gpu | --both]\n"
+                  << "  ids --pcap PATH --rules PATH [--cpu | --gpu | --both] [--reassemble]\n"
                   << "  ids --web [PORT] [--pcap PATH] [--rules PATH]\n";
         return 1;
     }
 
     PcapData   pcap = load_pcap(pcap_path);
     PatternSet ps   = load_patterns(rules_path);
-    double     mb   = static_cast<double>(pcap.bytes.size()) / 1e6;
 
-    std::cout << "Loaded " << pcap.num_packets << " packets ("
+    // Optionally reassemble TCP flows before matching.
+    // CPU reassembly: iterate packets, parse TCP headers, stitch streams.
+    // The reassembled PcapData has one "packet" per completed TCP flow.
+    PcapData reassembled;
+    if (do_reassemble) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        // CPU path: parse and reassemble
+        for (int i = 0; i < pcap.num_packets; i++) {
+            int pkt_start = pcap.offsets[i];
+            int pkt_len   = pcap.offsets[i + 1] - pkt_start;
+            TcpSegment seg = parse_tcp_segment(
+                pcap.bytes.data() + pkt_start, pkt_len);
+            if (!seg.valid) continue;
+
+            FlowBuffer* done = reassemble_segment(
+                seg.key, seg.payload, seg.len, seg.seq, seg.fin);
+            if (done && !done->data.empty()) {
+                reassembled.offsets.push_back((int)reassembled.bytes.size());
+                reassembled.bytes.insert(reassembled.bytes.end(),
+                                         done->data.begin(), done->data.end());
+                reassembled.num_packets++;
+            }
+        }
+        // Drain flows without FIN (end of capture)
+        for (auto& fb : flush_all_flows()) {
+            if (fb.data.empty()) continue;
+            reassembled.offsets.push_back((int)reassembled.bytes.size());
+            reassembled.bytes.insert(reassembled.bytes.end(),
+                                      fb.data.begin(), fb.data.end());
+            reassembled.num_packets++;
+        }
+        reassembled.offsets.push_back((int)reassembled.bytes.size()); // sentinel
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        std::cout << YELLOW << "[reassemble] " << reassembled.num_packets
+                  << " TCP streams from " << pcap.num_packets << " packets ("
+                  << elapsed_ms(t0, t1) << " ms)" << RESET << "\n\n";
+    }
+
+    // Use reassembled streams if available, otherwise raw packets
+    const PcapData& active = do_reassemble ? reassembled : pcap;
+    double mb = static_cast<double>(active.bytes.size()) / 1e6;
+
+    std::cout << "Scanning " << active.num_packets << " units ("
               << mb << " MB), " << ps.num_patterns << " patterns\n\n";
 
     if (ps.num_patterns > 1024) {
@@ -116,20 +161,20 @@ int main(int argc, char** argv) {
         if (do_gpu) return 1;
     }
 
-    std::vector<int>     hits(pcap.num_packets * ps.num_patterns, 0);
-    std::vector<uint8_t> pfac_hits(pcap.num_packets * ps.num_patterns, 0);
+    std::vector<int>     hits(active.num_packets * ps.num_patterns, 0);
+    std::vector<uint8_t> pfac_hits(active.num_packets * ps.num_patterns, 0);
 
     // -- CPU --
     if (do_cpu) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        run_cpu_matcher(pcap.bytes.data(), pcap.offsets.data(),
-                        pcap.num_packets, ps, hits.data());
+        run_cpu_matcher(active.bytes.data(), active.offsets.data(),
+                        active.num_packets, ps, hits.data());
         auto t1  = std::chrono::high_resolution_clock::now();
         double ms   = elapsed_ms(t0, t1);
         double mbps = mb / (ms / 1e3);
 
         std::cout << "=== CPU results ===\n";
-        print_alerts(hits.data(), pcap.num_packets, ps);
+        print_alerts(hits.data(), active.num_packets, ps);
         std::cout << GREEN << "CPU throughput: " << mbps << " MB/s"
                   << RESET << " (" << ms << " ms)\n\n";
     }
@@ -140,17 +185,17 @@ int main(int argc, char** argv) {
 
         auto t0 = std::chrono::high_resolution_clock::now();
         run_naive_match_gpu(
-            pcap.bytes.data(),  pcap.offsets.data(),     pcap.num_packets,
-            ps.bytes.data(),    ps.offsets.data(),        ps.num_patterns,
+            active.bytes.data(),  active.offsets.data(),  active.num_packets,
+            ps.bytes.data(),      ps.offsets.data(),      ps.num_patterns,
             hits.data(),
-            pcap.bytes.size(),  ps.bytes.size()
+            active.bytes.size(),  ps.bytes.size()
         );
         auto t1  = std::chrono::high_resolution_clock::now();
         double ms   = elapsed_ms(t0, t1);
         double mbps = mb / (ms / 1e3);
 
         std::cout << "=== GPU (naive) results ===\n";
-        print_alerts(hits.data(), pcap.num_packets, ps);
+        print_alerts(hits.data(), active.num_packets, ps);
         std::cout << GREEN << "GPU throughput: " << mbps << " MB/s"
                   << RESET << " (" << ms << " ms)\n\n";
     }
