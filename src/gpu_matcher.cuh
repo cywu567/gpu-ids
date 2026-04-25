@@ -14,10 +14,12 @@
  *     num_patterns must be <= 1024 (CUDA max threads per block).
  *     Intentionally unoptimized -- this is the punching bag.
  *
- *   run_pfac_match_gpu   (class project Week 2 -- stub, not yet implemented)
+ *   run_pfac_match_gpu   (class project Week 2 + Week 3 -- implemented)
  *     Parallel Failureless Aho-Corasick: one thread per (packet, start_offset)
  *     pair. Each thread walks the DFA forward from its assigned byte position
  *     until it reaches a dead state. Requires a pre-built DFA table.
+ *     Week 3: hot DFA states cached in shared memory (up to 48 KB = 96 states),
+ *     falling back to __ldg for deep states. Entire DFA fits for typical rule sets.
  *     Reference: Lin, Liu, Chang (2013) IEEE Trans. Computers.
  */
 
