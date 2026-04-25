@@ -1,0 +1,93 @@
+# Hand-curated generic indicators — always included
+# These cover broad attack categories and fire on synthetic.pcap
+
+# Path traversal
+../../etc/passwd
+../../../windows/win.ini
+
+# Web shells / code injection
+<?php
+eval(base64_decode
+<script>alert(
+
+# Command execution
+cmd.exe
+powershell.exe
+/bin/sh
+nc -e
+
+# Download cradles
+wget http://
+curl http://
+
+# SQL injection
+SELECT%20FROM
+UNION%20SELECT
+1=1--
+
+# Credential / token leakage
+PASSWORD=
+api_key=
+
+# Executable in HTTP traffic (PE header = .exe being downloaded)
+MZ
+
+# Old IE User-Agent — faked by malware since ~2014, no legitimate browser uses it
+User-Agent: Mozilla/4.0 (compatible; MSIE
+
+# NetSupport RAT (from real pcap)
+NetSupport Manager
+easyas123.tech
+/fakeurl.htm
+
+# === Snort/Emerging Threats derived patterns appended below ===
+sp_configure
+pjl_ready_message=
+/administrators.pwd
+/iisadmpwd/aexp2.htr
+/msadc/samples/
+/fpcount.exe
+/iisadmpwd/aexp
+/iissamples/
+/site/iisamples
+mstime_malloc
+java.lang.Runtime@getRuntime().exec(
+java.io.FileOutputStream
+sun.misc.BASE64Decoder
+initial-heap-size
+max-heap-size
+solusvmc-node
+java.lang.ProcessBuilder(
+WScript.Shell
+/post.php?referanceMod=
+/cgi-bin/override.cgi
+/cgi-bin/fw_sys_up.cgi
+/cgi-bin/share_editor.cgi
+/cgi-bin/switch_boot.cgi
+/PMConfig.dat
+/wsman/simple_auth.passwd
+__EventFilter
+ __InstanceModificationEvent
+Win32_LocalTime
+__FilterToConsumerBinding
+cmi/var/ssh/root/authorized_keys
+.atob(String.fromCharCode(
+n%61%6d%65%5b
+%6ea%6d%65%5b
+%6e%61m%65%5b
+%6e%61%6de%5b
+%6e%61%6d%65[
+%6e%61%6d%65%5b
+/cgi-bin/rtpd.cgi?
+/upnp/asf-mp4.asf
+/md/lums.cgi
+/var/run/.zollard/
+/ddnsmngr.cmd?action=apply
+&dnsSecondary=
+&dnsDynamic=
+&dnsRefresh=
+/dnscfg.cgi?
+dnsSecondary=
+ccp_act=ping_v6&ping_addr=
+/fwupgrade.ccp
+/index.php/mv_system/get_general_setup?_=1413463189043

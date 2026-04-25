@@ -1,0 +1,8 @@
+name: gpu-ids
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - libpcap
+  - cmake>=3.24
+  - vectorscan

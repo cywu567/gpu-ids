@@ -1,0 +1,51 @@
+# GPU-IDS pattern rules file
+# One pattern per line. Blank lines and lines starting with '#' are ignored.
+# These are broad HTTP/exploit indicators to start. After picking a malware
+# pcap, open it in Wireshark, find the HTTP streams, and add specific URLs,
+# User-Agent strings, and payload bytes you observe in the traffic.
+#
+# Keep this list under 1024 entries for the hackathon weekend -- the naive
+# kernel launches one thread per pattern and CUDA caps threads-per-block at
+# 1024. The class project PFAC kernel removes this constraint.
+
+# -- Directory traversal / LFI --
+GET /cgi-bin/
+../../etc/passwd
+/etc/shadow
+
+# -- Common web admin panels --
+/wp-login.php
+/wp-admin/
+/phpmyadmin/
+/admin/login
+/.env
+
+# -- SQL injection keywords --
+SELECT * FROM
+UNION SELECT
+1=1--
+OR 1=1
+
+# -- XSS / script injection --
+<script>
+javascript:
+onerror=
+
+# -- Shell / command execution --
+cmd.exe
+powershell
+/bin/sh
+/bin/bash
+nc -e
+
+# -- Downloader patterns --
+wget http://
+curl http://
+
+# -- Suspicious User-Agents (add specific malware UAs from your pcap) --
+User-Agent: Mozilla/4.0 (compatible; MSIE
+
+# -- Credential / key leakage indicators --
+PASSWORD=
+api_key=
+authorization: Bearer
