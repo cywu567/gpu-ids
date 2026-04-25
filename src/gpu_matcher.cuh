@@ -91,6 +91,21 @@ struct PfacDfa {
 PfacDfa build_pfac_dfa(const PatternSet& ps);
 
 /**
+ * PFAC baseline: uses __ldg read-only cache only (no shared memory).
+ * Kept for head-to-head comparison against run_pfac_match_gpu in the benchmark.
+ * Use --pfac-baseline in the benchmark binary.
+ */
+void run_pfac_match_gpu_baseline(
+    const uint8_t* h_input,
+    const int*     h_offsets,
+    int            num_packets,
+    const PfacDfa& dfa,
+    uint8_t*       h_hits,
+    int            num_patterns,
+    size_t         input_len
+);
+
+/**
  * PFAC GPU matcher.
  *
  * One CUDA block per packet. Each thread handles one or more starting byte
