@@ -116,16 +116,111 @@ Start the server on the remote machine (default port 8080):
 ./build/ids --web 8080 --pcap data/demo.pcap --rules patterns/rules.txt
 ```
 
-The dashboard shows three bars: CPU (yellow), GPU PFAC (green), Hyperscan (purple),
-and a live speedup ratio.
+The dashboard at **https://cudashield.tech** shows three bars: CPU (yellow), GPU PFAC (green),
+Hyperscan (purple), and a live speedup ratio.
 
-Then, in a **separate terminal on your laptop**, forward the port:
+**Option A — Local access via SSH port forwarding** (no tunnel needed):
 
+In a separate terminal on your laptop:
 ```bash
 ssh -L 8080:localhost:8080 user@remote-machine
 ```
+Then open [http://localhost:8080](http://localhost:8080).
 
-Open [http://localhost:8080](http://localhost:8080) in your browser.
+**Option B — Public access via Cloudflare Tunnel** (see [Cloudflare Tunnel setup](#cloudflare-tunnel-setup) below):
+
+In a second terminal on the server, start the tunnel:
+```bash
+~/cloudflared tunnel run cudashield
+```
+Then open [https://cudashield.tech](https://cudashield.tech) from any browser.
+
+> **Chrome users:** if you see `ERR_QUIC_PROTOCOL_ERROR`, go to Cloudflare dashboard →
+> cudashield.tech → **Speed → Optimization → Protocol Optimization** and turn off
+> **HTTP/3 (with QUIC)**. Alternatively, go to `chrome://flags/#enable-quic`, set to
+> Disabled, and fully relaunch Chrome (Cmd+Q).
+
+---
+
+## Cloudflare Tunnel setup
+
+The server runs on a shared GPU cluster (Caltech titan) where the firewall blocks inbound
+connections on non-standard ports. Cloudflare Tunnel creates an outbound-only connection
+so the public domain `cudashield.tech` routes through Cloudflare to the server without
+needing firewall changes or root access.
+
+### One-time setup (already done — for reference)
+
+**1. Cloudflare account and domain**
+
+- Register `cudashield.tech` at [get.tech](https://get.tech)
+- Create a free Cloudflare account and add `cudashield.tech` as a site
+- In Cloudflare, get the two assigned nameservers and set them at get.tech under **Nameservers**
+- Wait for Cloudflare to confirm the domain is active (email notification)
+
+**2. Install cloudflared on the server** (no root needed)
+
+```bash
+wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O ~/cloudflared
+chmod +x ~/cloudflared
+~/cloudflared --version   # verify
+```
+
+**3. Authenticate**
+
+```bash
+~/cloudflared tunnel login
+```
+
+Open the printed URL in a browser and select `cudashield.tech`. A certificate is saved to
+`~/.cloudflared/` automatically.
+
+**4. Create the tunnel**
+
+```bash
+~/cloudflared tunnel create cudashield
+```
+
+Note the tunnel ID printed (e.g. `66667b15-9f4d-4baa-a00e-77bfba54d11f`).
+
+**5. Write the config file**
+
+```bash
+cat > ~/.cloudflared/config.yml << 'EOF'
+tunnel: <your-tunnel-id>
+credentials-file: /home/<username>/.cloudflared/<your-tunnel-id>.json
+ingress:
+  - hostname: cudashield.tech
+    service: http://localhost:8080
+  - service: http_status:404
+EOF
+```
+
+**6. Route the domain to the tunnel**
+
+```bash
+~/cloudflared tunnel route dns cudashield cudashield.tech
+```
+
+This creates a CNAME record in Cloudflare DNS pointing `cudashield.tech` to the tunnel.
+If you get an error about a conflicting A record, delete the existing A record in the
+Cloudflare DNS dashboard first, then re-run.
+
+### Starting the tunnel
+
+Every time you want the public URL to work, run both of these (in separate terminals):
+
+```bash
+# Terminal 1 — IDS server
+cd ~/gpu-ids
+./build/ids --web 8080 --pcap data/2025-06-13-traffic-analysis-exercise.pcap --rules patterns/rules.txt
+
+# Terminal 2 — Cloudflare tunnel
+~/cloudflared tunnel run cudashield
+```
+
+The tunnel log should show `Registered tunnel connection` for 4 connections and then stay
+idle. The site is live at **https://cudashield.tech**.
 
 ---
 
