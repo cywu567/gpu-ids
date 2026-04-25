@@ -21,6 +21,7 @@
 #include "httplib.h"
 
 #include "cpu_matcher.h"
+#include "flow_reassembly.cuh"
 #include "flow_stats.cuh"
 #include "gpu_matcher.cuh"
 #include "load_pcap.h"
@@ -53,6 +54,9 @@ struct ScanStatus {
     std::string error;
     int         num_packets = 0;
     int         num_patterns= 0;
+    bool        reassembled   = false;
+    int         num_streams   = 0;
+    double      reassemble_ms = 0;
     bool        cpu_done    = false;
     double      cpu_ms      = 0;
     double      cpu_mbps    = 0;
@@ -107,6 +111,9 @@ static std::string status_to_json() {
       << "  \"error\":" << '"' << json_esc(g_status.error) << '"' << ",\n"
       << "  \"num_packets\":" << g_status.num_packets << ",\n"
       << "  \"num_patterns\":" << g_status.num_patterns << ",\n"
+      << "  \"reassembled\":" << (g_status.reassembled ? "true" : "false") << ",\n"
+      << "  \"num_streams\":" << g_status.num_streams << ",\n"
+      << "  \"reassemble_ms\":" << g_status.reassemble_ms << ",\n"
       << "  \"cpu\":{"
           << "\"done\":" << (g_status.cpu_done ? "true" : "false") << ","
           << "\"ms\":"   << g_status.cpu_ms   << ","
@@ -184,13 +191,23 @@ static std::string json_get(const std::string& body, const std::string& key) {
     return val;
 }
 
+static bool json_get_bool(const std::string& body, const std::string& key) {
+    std::string needle = "\"" + key + "\"";
+    auto pos = body.find(needle);
+    if (pos == std::string::npos) return false;
+    pos += needle.size();
+    while (pos < body.size() && (body[pos] == ' ' || body[pos] == ':')) ++pos;
+    return body.size() >= pos + 4 && body.substr(pos, 4) == "true";
+}
+
 // ---------------------------------------------------------------------------
 // Core scan logic
 // ---------------------------------------------------------------------------
 
 static std::string do_scan(const std::string& pcap_path,
                             const std::string& rules_path,
-                            bool do_cpu, bool do_gpu, bool do_hs)
+                            bool do_cpu, bool do_gpu, bool do_hs,
+                            bool do_reassemble)
 {
     // Mark scanning
     {
@@ -202,7 +219,6 @@ static std::string do_scan(const std::string& pcap_path,
     try {
         PcapData   pcap = load_pcap(pcap_path);
         PatternSet ps   = load_patterns(rules_path);
-        double     mb   = static_cast<double>(pcap.bytes.size()) / 1e6;
 
         {
             std::lock_guard<std::mutex> lk(g_mu);
@@ -210,6 +226,7 @@ static std::string do_scan(const std::string& pcap_path,
             g_status.num_patterns = ps.num_patterns;
         }
 
+        // Flow stats always run on raw packets (per-packet timing/size analysis).
         {
             FlowGrouping groups = group_flows_by_5tuple(pcap);
             std::vector<FlowStatResult> fstats;
@@ -218,21 +235,57 @@ static std::string do_scan(const std::string& pcap_path,
             g_status.flow_stats = std::move(fstats);
         }
 
-        std::vector<int>     hits(pcap.num_packets * ps.num_patterns, 0);
-        std::vector<uint8_t> pfac_hits(pcap.num_packets * ps.num_patterns, 0);
+        // Optional TCP reassembly — stitches TCP segments into full streams
+        // so split-payload evasion (pattern split across packets) is caught.
+        PcapData reassembled;
+        if (do_reassemble) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < pcap.num_packets; i++) {
+                int pkt_start = pcap.offsets[i];
+                int pkt_len   = pcap.offsets[i + 1] - pkt_start;
+                TcpSegment seg = parse_tcp_segment(
+                    pcap.bytes.data() + pkt_start, pkt_len);
+                if (!seg.valid) continue;
+                FlowBuffer* done = reassemble_segment(
+                    seg.key, seg.payload, seg.len, seg.seq, seg.fin);
+                if (done && !done->data.empty()) {
+                    reassembled.offsets.push_back((int)reassembled.bytes.size());
+                    reassembled.bytes.insert(reassembled.bytes.end(),
+                                             done->data.begin(), done->data.end());
+                    reassembled.num_packets++;
+                }
+            }
+            for (auto& fb : flush_all_flows()) {
+                if (fb.data.empty()) continue;
+                reassembled.offsets.push_back((int)reassembled.bytes.size());
+                reassembled.bytes.insert(reassembled.bytes.end(),
+                                          fb.data.begin(), fb.data.end());
+                reassembled.num_packets++;
+            }
+            reassembled.offsets.push_back((int)reassembled.bytes.size());
+            auto t1 = std::chrono::high_resolution_clock::now();
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_status.reassembled   = true;
+                g_status.num_streams   = reassembled.num_packets;
+                g_status.reassemble_ms = ms_between(t0, t1);
+            }
+        }
 
-        // Touch all packet bytes to ensure they're in the OS page cache before
-        // any timed scan runs. Without this, the first engine (CPU) pays the
-        // page-fault cost and the later engines (GPU, Hyperscan) get an unfair
-        // warm-cache advantage, making results non-deterministic on small pcaps.
+        const PcapData& active = do_reassemble ? reassembled : pcap;
+        double mb = static_cast<double>(active.bytes.size()) / 1e6;
+
+        // Touch all bytes to warm OS page cache before timed runs.
         volatile uint8_t sink = 0;
-        for (const auto& b : pcap.bytes) sink ^= b;
+        for (const auto& b : active.bytes) sink ^= b;
         (void)sink;
 
+        std::vector<int>     hits(active.num_packets * ps.num_patterns, 0);
+        std::vector<uint8_t> pfac_hits(active.num_packets * ps.num_patterns, 0);
+
         auto collect_alerts = [&](const std::string& mode) {
-            // For GPU PFAC path, read from pfac_hits (uint8_t); else from hits (int).
             bool use_pfac = (mode == "gpu");
-            for (int p = 0; p < pcap.num_packets; p++) {
+            for (int p = 0; p < active.num_packets; p++) {
                 for (int r = 0; r < ps.num_patterns; r++) {
                     int idx = p * ps.num_patterns + r;
                     int hit = use_pfac ? (int)pfac_hits[idx] : hits[idx];
@@ -251,8 +304,8 @@ static std::string do_scan(const std::string& pcap_path,
 
         if (do_cpu) {
             auto t0 = std::chrono::high_resolution_clock::now();
-            run_cpu_matcher(pcap.bytes.data(), pcap.offsets.data(),
-                            pcap.num_packets, ps, hits.data());
+            run_cpu_matcher(active.bytes.data(), active.offsets.data(),
+                            active.num_packets, ps, hits.data());
             auto t1 = std::chrono::high_resolution_clock::now();
             double ms = ms_between(t0, t1);
             {
@@ -269,8 +322,8 @@ static std::string do_scan(const std::string& pcap_path,
             PfacDfa dfa = build_pfac_dfa(ps);
             auto t0 = std::chrono::high_resolution_clock::now();
             run_pfac_match_gpu(
-                pcap.bytes.data(), pcap.offsets.data(), pcap.num_packets,
-                dfa, pfac_hits.data(), ps.num_patterns, pcap.bytes.size());
+                active.bytes.data(), active.offsets.data(), active.num_packets,
+                dfa, pfac_hits.data(), ps.num_patterns, active.bytes.size());
             auto t1 = std::chrono::high_resolution_clock::now();
             double ms = ms_between(t0, t1);
             {
@@ -303,11 +356,11 @@ static std::string do_scan(const std::string& pcap_path,
                 hs_alloc_scratch(db, &scratch);
                 std::fill(hits.begin(), hits.end(), 0);
                 auto t0 = std::chrono::high_resolution_clock::now();
-                for (int p = 0; p < pcap.num_packets; p++) {
+                for (int p = 0; p < active.num_packets; p++) {
                     const char* pkt = reinterpret_cast<const char*>(
-                        pcap.bytes.data() + pcap.offsets[p]);
+                        active.bytes.data() + active.offsets[p]);
                     unsigned pkt_len = static_cast<unsigned>(
-                        pcap.offsets[p + 1] - pcap.offsets[p]);
+                        active.offsets[p + 1] - active.offsets[p]);
                     struct PktCtx { int p; int np; std::vector<int>* hits; };
                     PktCtx pctx{p, ps.num_patterns, &hits};
                     hs_scan(db, pkt, pkt_len, 0, scratch,
@@ -479,6 +532,13 @@ static const char* DASHBOARD_HTML = R"html(<!DOCTYPE html>
       <label><input type="radio" name="mode" value="all">  All (+ Hyperscan)</label>
     </div>
   </div>
+  <div class="form-row">
+    <label>Options</label>
+    <label style="color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:6px;width:auto">
+      <input type="checkbox" id="reassemble-cb" style="accent-color:#58a6ff;cursor:pointer">
+      TCP reassembly (defeat split-payload evasion)
+    </label>
+  </div>
   <div class="form-row" style="margin-top:6px">
     <button class="btn" id="scan-btn" onclick="startScan()">&#x25b6; Run Scan</button>
     <span class="status-msg" id="status-msg"></span>
@@ -499,6 +559,10 @@ static const char* DASHBOARD_HTML = R"html(<!DOCTYPE html>
     <div class="stat-box">
       <span class="stat-label">Alerts</span>
       <span class="stat-value stat-alerts" id="s-alerts">—</span>
+    </div>
+    <div class="stat-box" id="streams-box" style="display:none">
+      <span class="stat-label">TCP Streams</span>
+      <span class="stat-value" style="color:#58a6ff" id="s-streams">—</span>
     </div>
     <div class="stat-box" id="speedup-box" style="display:none">
       <span class="stat-label">GPU vs CPU</span>
@@ -563,9 +627,10 @@ function setStatus(msg, cls) {
 }
 
 async function startScan() {
-  const pcap  = document.getElementById('pcap-input').value.trim()  || 'data/test.pcap';
-  const rules = document.getElementById('rules-input').value.trim() || 'patterns/rules.txt';
-  const mode  = document.querySelector('input[name=mode]:checked').value;
+  const pcap       = document.getElementById('pcap-input').value.trim()  || 'data/test.pcap';
+  const rules      = document.getElementById('rules-input').value.trim() || 'patterns/rules.txt';
+  const mode       = document.querySelector('input[name=mode]:checked').value;
+  const reassemble = document.getElementById('reassemble-cb').checked;
 
   document.getElementById('scan-btn').disabled = true;
   document.getElementById('results-section').style.display = 'none';
@@ -577,7 +642,7 @@ async function startScan() {
     const resp = await fetch('/api/scan', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({pcap, rules, mode})
+      body: JSON.stringify({pcap, rules, mode, reassemble})
     });
     const d = await resp.json();
     renderResults(d);
@@ -599,6 +664,13 @@ function renderResults(d) {
 
   document.getElementById('s-packets').textContent  = (d.num_packets  || 0).toLocaleString();
   document.getElementById('s-patterns').textContent = (d.num_patterns || 0).toLocaleString();
+
+  if (d.reassembled) {
+    document.getElementById('s-streams').textContent = (d.num_streams || 0).toLocaleString();
+    document.getElementById('streams-box').style.display = 'flex';
+  } else {
+    document.getElementById('streams-box').style.display = 'none';
+  }
 
   const alerts = d.alerts || [];
   document.getElementById('s-alerts').textContent = alerts.length;
@@ -734,11 +806,12 @@ void run_web_server(int port,
         std::string mode  = json_get(req.body, "mode");
         if (pcap.empty())  pcap  = "data/test.pcap";
         if (rules.empty()) rules = "patterns/rules.txt";
-        bool do_cpu = (mode == "cpu"  || mode == "both" || mode == "all" || mode.empty());
-        bool do_gpu = (mode == "gpu"  || mode == "both" || mode == "all" || mode.empty());
-        bool do_hs  = (mode == "hyperscan" || mode == "all");
+        bool do_cpu        = (mode == "cpu"  || mode == "both" || mode == "all" || mode.empty());
+        bool do_gpu        = (mode == "gpu"  || mode == "both" || mode == "all" || mode.empty());
+        bool do_hs         = (mode == "hyperscan" || mode == "all");
+        bool do_reassemble = json_get_bool(req.body, "reassemble");
 
-        std::string result = do_scan(pcap, rules, do_cpu, do_gpu, do_hs);
+        std::string result = do_scan(pcap, rules, do_cpu, do_gpu, do_hs, do_reassemble);
         res.set_content(result, "application/json");
     });
 
