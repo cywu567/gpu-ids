@@ -4,4 +4,6 @@ results/
 data/synthetic_6*.pcap
 data/synthetic_1*.pcap 
 data/synthetic_large*.pcap
+data/synthetic_30mb.pcap
+data/demo.pcap
 pcap-tshark-analysis/
