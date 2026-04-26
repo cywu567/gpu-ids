@@ -124,23 +124,4 @@ void run_pfac_match_gpu(
     size_t         input_len
 );
 
-/**
- * Chunked 2D grid PFAC matcher — fixes GPU underutilization when processing
- * a small number of large streams (e.g. TCP reassembly output).
- *
- * Grid: dim3(num_packets, max_chunks) where max_chunks = ceil(max_stream_len / CHUNK).
- * Each block handles starting positions within an 8 KB slice of one stream.
- * For raw packets (< 8 KB) max_chunks == 1, so cost is identical to a 1D grid.
- * Uses __ldg + L2 cache instead of shared memory — the DFA (~100 KB) fits
- * in L2, so smem loading (48 KB × num_blocks) would cost more than it saves.
- */
-void run_pfac_match_gpu_chunked(
-    const uint8_t* h_input,
-    const int*     h_offsets,
-    int            num_packets,
-    const PfacDfa& dfa,
-    uint8_t*       h_hits,
-    int            num_patterns,
-    size_t         input_len
-);
 // ---------------------------------------------------------------------------

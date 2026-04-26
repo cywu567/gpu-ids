@@ -23,7 +23,7 @@
 #include <thrust/device_vector.h>
 
 // ---------------------------------------------------------------------------
-// Header layout (same as flow_reassembly.cu — replicated to stay standalone)
+// Header layout for Ethernet/IP/TCP/UDP parsing
 // ---------------------------------------------------------------------------
 
 #pragma pack(push, 1)
