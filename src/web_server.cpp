@@ -281,10 +281,6 @@ static std::string do_scan(const std::string& pcap_path,
         const PcapData& active = do_reassemble ? reassembled : pcap;
         double mb = static_cast<double>(active.bytes.size()) / 1e6;
 
-        // Touch all bytes to warm OS page cache before timed runs.
-        volatile uint8_t sink = 0;
-        for (const auto& b : active.bytes) sink ^= b;
-        (void)sink;
 
         std::vector<int>     hits(active.num_packets * ps.num_patterns, 0);
         std::vector<uint8_t> pfac_hits(active.num_packets * ps.num_patterns, 0);
