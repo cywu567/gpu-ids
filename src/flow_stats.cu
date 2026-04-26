@@ -258,7 +258,9 @@ void run_flow_stats_gpu(
     cudaMemcpy(d_foff,  groups.flow_offsets.data(),(F + 1) * sizeof(int),cudaMemcpyHostToDevice);
 
     flow_stats_kernel<<<F, BLOCK_SIZE>>>(d_ts, d_sizes, d_flat, d_foff, F, d_out);
-    cudaDeviceSynchronize();
+    cudaError_t kerr = cudaDeviceSynchronize();
+    if (kerr != cudaSuccess)
+        std::fprintf(stderr, "[flow_stats] kernel error: %s\n", cudaGetErrorString(kerr));
 
     std::vector<FlowStatGpu> h_out(F);
     cudaMemcpy(h_out.data(), d_out, F * sizeof(FlowStatGpu), cudaMemcpyDeviceToHost);
