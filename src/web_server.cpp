@@ -68,6 +68,7 @@ struct ScanStatus {
     double      hs_mbps     = 0;
     std::vector<Alert>          alerts;
     std::vector<FlowStatResult> flow_stats;
+    double      flow_stats_ms = 0;
 };
 
 static std::mutex  g_mu;
@@ -129,6 +130,7 @@ static std::string status_to_json() {
           << "\"ms\":"   << g_status.hs_ms   << ","
           << "\"mbps\":" << g_status.hs_mbps
       << "},\n"
+      << "  \"flow_stats_ms\":" << g_status.flow_stats_ms << ",\n"
       << "  \"alerts\":[";
 
     bool first = true;
@@ -207,7 +209,7 @@ static bool json_get_bool(const std::string& body, const std::string& key) {
 static std::string do_scan(const std::string& pcap_path,
                             const std::string& rules_path,
                             bool do_cpu, bool do_gpu, bool do_hs,
-                            bool do_reassemble)
+                            bool do_reassemble, bool do_flow_stats)
 {
     // Mark scanning
     {
@@ -226,13 +228,16 @@ static std::string do_scan(const std::string& pcap_path,
             g_status.num_patterns = ps.num_patterns;
         }
 
-        // Flow stats always run on raw packets (per-packet timing/size analysis).
-        {
+        // Optional beacon-detection: group flows by 5-tuple, run GPU stats kernel.
+        if (do_flow_stats) {
+            auto t0 = std::chrono::high_resolution_clock::now();
             FlowGrouping groups = group_flows_by_5tuple(pcap);
             std::vector<FlowStatResult> fstats;
             run_flow_stats_gpu(pcap, groups, fstats);
+            auto t1 = std::chrono::high_resolution_clock::now();
             std::lock_guard<std::mutex> lk(g_mu);
-            g_status.flow_stats = std::move(fstats);
+            g_status.flow_stats    = std::move(fstats);
+            g_status.flow_stats_ms = ms_between(t0, t1);
         }
 
         // Optional TCP reassembly — stitches TCP segments into full streams
@@ -530,10 +535,16 @@ static const char* DASHBOARD_HTML = R"html(<!DOCTYPE html>
   </div>
   <div class="form-row">
     <label>Options</label>
-    <label style="color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:6px;width:auto">
-      <input type="checkbox" id="reassemble-cb" style="accent-color:#58a6ff;cursor:pointer">
-      TCP reassembly (defeat split-payload evasion)
-    </label>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <label style="color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="reassemble-cb" style="accent-color:#58a6ff;cursor:pointer">
+        TCP reassembly (defeat split-payload evasion)
+      </label>
+      <label style="color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="flow-stats-cb" style="accent-color:#58a6ff;cursor:pointer" checked>
+        Beacon detection (flow statistics)
+      </label>
+    </div>
   </div>
   <div class="form-row" style="margin-top:6px">
     <button class="btn" id="scan-btn" onclick="startScan()">&#x25b6; Run Scan</button>
@@ -563,6 +574,11 @@ static const char* DASHBOARD_HTML = R"html(<!DOCTYPE html>
     <div class="stat-box" id="speedup-box" style="display:none">
       <span class="stat-label">GPU vs CPU</span>
       <span class="stat-value stat-speedup" id="s-speedup">—</span>
+    </div>
+    <div class="stat-box" id="fstats-box" style="display:none">
+      <span class="stat-label">Beacon detection</span>
+      <span class="stat-value" style="color:#a5d6ff" id="s-fstats-ms">—</span>
+      <span style="font-size:0.8rem;color:#8b949e">ms</span>
     </div>
   </div>
 
@@ -625,8 +641,9 @@ function setStatus(msg, cls) {
 async function startScan() {
   const pcap       = document.getElementById('pcap-input').value.trim()  || 'data/test.pcap';
   const rules      = document.getElementById('rules-input').value.trim() || 'patterns/rules.txt';
-  const mode       = document.querySelector('input[name=mode]:checked').value;
-  const reassemble = document.getElementById('reassemble-cb').checked;
+  const mode        = document.querySelector('input[name=mode]:checked').value;
+  const reassemble  = document.getElementById('reassemble-cb').checked;
+  const flow_stats  = document.getElementById('flow-stats-cb').checked;
 
   document.getElementById('scan-btn').disabled = true;
   document.getElementById('results-section').style.display = 'none';
@@ -638,7 +655,7 @@ async function startScan() {
     const resp = await fetch('/api/scan', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({pcap, rules, mode, reassemble})
+      body: JSON.stringify({pcap, rules, mode, reassemble, flow_stats})
     });
     const d = await resp.json();
     renderResults(d);
@@ -708,6 +725,13 @@ function renderResults(d) {
     }
     document.getElementById('s-speedup').textContent = speedupText;
     document.getElementById('speedup-box').style.display = 'flex';
+  }
+
+  if (d.flow_stats_ms > 0) {
+    document.getElementById('s-fstats-ms').textContent = d.flow_stats_ms.toFixed(1);
+    document.getElementById('fstats-box').style.display = 'flex';
+  } else {
+    document.getElementById('fstats-box').style.display = 'none';
   }
 
   if (alerts.length > 0) {
@@ -806,8 +830,9 @@ void run_web_server(int port,
         bool do_gpu        = (mode == "gpu"  || mode == "both" || mode == "all" || mode.empty());
         bool do_hs         = (mode == "hyperscan" || mode == "all");
         bool do_reassemble = json_get_bool(req.body, "reassemble");
+        bool do_flow_stats = json_get_bool(req.body, "flow_stats");
 
-        std::string result = do_scan(pcap, rules, do_cpu, do_gpu, do_hs, do_reassemble);
+        std::string result = do_scan(pcap, rules, do_cpu, do_gpu, do_hs, do_reassemble, do_flow_stats);
         res.set_content(result, "application/json");
     });
 
