@@ -89,8 +89,8 @@ int main(int argc, char** argv) {
 
     // Web dashboard mode: serve the interactive UI, ignore --cpu/--gpu flags.
     if (do_web) {
-        std::cout << "CudaShield dashboard at http://localhost:" << web_port << "\n"
-                  << "Press Ctrl+C to stop.\n";
+        std::cout << "CudaShield dashboard at http://cudashield.tech:" << web_port << "\n"
+                  << "  (also reachable locally at http://localhost:" << web_port << ")\n"
         run_web_server(web_port, pcap_path, rules_path);
         return 0;
     }
