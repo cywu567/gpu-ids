@@ -1,6 +1,6 @@
 /**
  * @file flow_reassembly.cuh
- * @brief TCP flow reassembly interface (class project Week 3).
+ * @brief TCP flow reassembly interface.
  *
  * A TCP flow is identified by its 5-tuple: (src IP, dst IP, src port, dst
  * port, protocol). The reassembler tracks per-flow state, buffers
@@ -14,13 +14,13 @@
  *
  * == Implementation ==
  *
- * CPU path (Week 3a):
+ * CPU path:
  *   std::unordered_map<FlowKey, FlowBuffer> as the flow table.
  *   FlowBuffer holds a gap-map (std::map<uint32_t, bytes>) for out-of-order
  *   segments and next_seq for the next expected byte.
  *   On FIN/RST the completed stream is returned as a flat byte buffer.
  *
- * GPU path (Week 3b):
+ * GPU path:
  *   Open-addressing hash table (GpuFlowSlot[]) on device.
  *   One warp per segment: lane 0 drives atomicCAS linear probe;
  *   all 32 lanes cooperate to copy payload into the per-flow buffer slot
@@ -133,7 +133,7 @@ FlowBuffer* reassemble_segment(
 std::vector<FlowBuffer> flush_all_flows();
 
 // ---------------------------------------------------------------------------
-// GPU-path structs and API (Week 3b)
+// GPU-path structs and API
 // ---------------------------------------------------------------------------
 
 /** Maximum payload bytes stored per flow in GPU memory. */

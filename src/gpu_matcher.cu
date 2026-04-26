@@ -2,7 +2,7 @@
  * @file gpu_matcher.cu
  * @brief GPU pattern-matching kernels and host-side launch code.
  *
- * == Hackathon weekend: naive kernel ==
+ * == Naive kernel ==
  *
  * Grid:  blockIdx.x  = packet index (one block per packet)
  * Block: threadIdx.x = pattern index (one thread per pattern)
@@ -11,22 +11,21 @@
  * its pattern inside its packet, then sets hits[packet * num_patterns + pattern]
  * and returns. No shared memory, no warp-level coordination. Lots of warp
  * divergence when packets have different lengths and patterns match at
- * different positions. This is fine -- it's the punching bag we'll improve.
+ * different positions. Kept as a performance baseline.
  *
- * Constraint: num_patterns <= 1024 (CUDA max threads per block). Fine for
- * the weekend's ~50-pattern rule set. The PFAC kernel removes this limit.
+ * Constraint: num_patterns <= 1024 (CUDA max threads per block).
+ * The PFAC kernel removes this limit.
  *
- * == Class project Week 2: PFAC kernel (TODO) ==
+ * == PFAC kernel (Parallel Failureless Aho-Corasick) ==
  *
- * Replace the naive kernel with Parallel Failureless Aho-Corasick:
- *   - Pre-build a DFA (state * 256 transition table) from all patterns.
- *   - One thread per (packet, start_offset): thread t starts at byte t of
- *     the flattened input and walks the DFA forward until a dead state.
- *   - No failure links needed at runtime -- hence "failureless."
+ * Pre-builds a DFA (state * 256 transition table) from all patterns.
+ * One thread per (packet, start_offset): thread t starts at byte t of
+ * the flattened input and walks the DFA forward until a dead state.
+ * No failure links needed at runtime -- hence "failureless."
  * Reference: Lin, Liu, Chang (2013) "Accelerating Pattern Matching Using a
  * Novel Parallel Algorithm on GPUs." IEEE Transactions on Computers.
  *
- * == Class project Week 3: memory layout optimization (implemented) ==
+ * == PFAC shared-memory variant ==
  *
  * The DFA table is (num_states * 256 * 2) bytes with uint16_t encoding.
  * For ~26 patterns the table is ~100 KB -- larger than the 32 KB read-only
@@ -136,7 +135,7 @@ void run_naive_match_gpu(
 }
 
 // ---------------------------------------------------------------------------
-// TODO (Week 2): PFAC DFA builder (host-side)
+// PFAC DFA builder (host-side)
 // ---------------------------------------------------------------------------
 
 PfacDfa build_pfac_dfa(const PatternSet& ps) {
@@ -225,7 +224,7 @@ __global__ void pfac_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// PFAC kernel — Week 3: shared memory DFA cache
+// PFAC kernel — shared memory DFA cache
 // ---------------------------------------------------------------------------
 
 /**

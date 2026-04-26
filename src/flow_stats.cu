@@ -152,22 +152,21 @@ __global__ void flow_stats_kernel(
     float l_iat_sum = 0.f, l_iat_sq = 0.f;
     float l_sz_sum  = 0.f, l_sz_sq  = 0.f;
 
-    // Each thread accumulates a stripe; handles flows > BLOCK_SIZE via loop
+    // Each thread accumulates a stripe; handles flows > BLOCK_SIZE via loop.
+    // IAT is only computed when t-1 belongs to the same thread's stride
+    // (i.e., t % BLOCK_SIZE != 0), avoiding cross-stride reads of another
+    // thread's last packet which would produce spurious IAT measurements.
     for (int t = threadIdx.x; t < n; t += BLOCK_SIZE) {
         int pkt_i = flat_idx[f_start + t];
         float sz  = (float)sizes[pkt_i];
         l_sz_sum += sz;
         l_sz_sq  += sz * sz;
 
-        if (t > 0) {
-            int pkt_prev = flat_idx[f_start + t - 1];
-            // Guard: prev may have been loaded by a different iteration of the
-            // outer loop on a different thread — we only compute the IAT for
-            // positions where (t-1) belongs to *this* thread's stripe OR we
-            // re-read the previous packet's timestamp (cheap global read).
-            float iat = (float)((int64_t)timestamps_us[pkt_i]
-                              - (int64_t)timestamps_us[pkt_prev]);
-            if (iat > 0.f) {           // skip out-of-order edge cases
+        if (t > 0 && t % BLOCK_SIZE != 0) {
+            int   pkt_prev = flat_idx[f_start + t - 1];
+            float iat      = (float)((int64_t)timestamps_us[pkt_i]
+                                   - (int64_t)timestamps_us[pkt_prev]);
+            if (iat > 0.f) {
                 l_iat_sum += iat;
                 l_iat_sq  += iat * iat;
             }

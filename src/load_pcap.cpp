@@ -11,7 +11,7 @@
  * always compute packet length as offsets[i+1] - offsets[i], with no special
  * case for the last packet.
  *
- * Limitations (acceptable for the hackathon weekend):
+ * Limitations:
  *   - Loads the entire capture into memory before returning.
  *   - No streaming / incremental processing.
  *   - Truncated packets (caplen < len) are stored at their captured size.

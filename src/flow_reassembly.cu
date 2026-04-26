@@ -1,6 +1,6 @@
 /**
  * @file flow_reassembly.cu
- * @brief TCP flow reassembly — CPU path (Week 3a) + GPU kernels (Week 3b).
+ * @brief TCP flow reassembly — CPU path + GPU kernels.
  *
  * CPU path:
  *   parse_tcp_segment() cracks Ethernet/IP/TCP headers.
@@ -30,6 +30,13 @@
 #include <functional>
 #include <stdexcept>
 #include <unordered_map>
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t _e = (call); \
+    if (_e != cudaSuccess) \
+        throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(_e) \
+                                 + " at " __FILE__ ":" + std::to_string(__LINE__)); \
+} while (0)
 
 // ---------------------------------------------------------------------------
 // FlowKey equality and hash
@@ -221,13 +228,13 @@ GpuFlowTable alloc_gpu_flow_table(int max_flows, int max_total_payload_bytes) {
     t.table_size        = max_flows;        // caller must pass power-of-two
     t.payload_buf_size  = max_total_payload_bytes;
 
-    cudaMalloc(&t.d_slots,           (size_t)max_flows * sizeof(GpuFlowSlot));
-    cudaMalloc(&t.d_payload_buf,     (size_t)max_total_payload_bytes);
-    cudaMalloc(&t.d_payload_buf_top, sizeof(int));
+    CUDA_CHECK(cudaMalloc(&t.d_slots,           (size_t)max_flows * sizeof(GpuFlowSlot)));
+    CUDA_CHECK(cudaMalloc(&t.d_payload_buf,     (size_t)max_total_payload_bytes));
+    CUDA_CHECK(cudaMalloc(&t.d_payload_buf_top, sizeof(int)));
 
-    cudaMemset(t.d_slots,           0, (size_t)max_flows * sizeof(GpuFlowSlot));
-    cudaMemset(t.d_payload_buf,     0, (size_t)max_total_payload_bytes);
-    cudaMemset(t.d_payload_buf_top, 0, sizeof(int));
+    CUDA_CHECK(cudaMemset(t.d_slots,           0, (size_t)max_flows * sizeof(GpuFlowSlot)));
+    CUDA_CHECK(cudaMemset(t.d_payload_buf,     0, (size_t)max_total_payload_bytes));
+    CUDA_CHECK(cudaMemset(t.d_payload_buf_top, 0, sizeof(int)));
     return t;
 }
 
@@ -397,20 +404,19 @@ __global__ void mark_complete_kernel(
 
 /**
  * compact_flows_kernel: scatter completed flows into the contiguous output
- * buffer using exclusive prefix-sum offsets computed by thrust on the host.
+ * buffer using exclusive prefix-sum byte offsets computed by thrust on the host.
  *
- * d_scan[i] = sum of d_sizes[0..i-1] for complete slots (i.e., exclusive scan
- * of d_sizes masked by d_flags).
+ * d_scan_bytes[i] = exclusive prefix-sum of (flags[i] * sizes[i]) — the byte
+ * offset in out_buf where flow i's payload should be written.
+ * out_offsets is built on the CPU after copyback; it is not written here.
  */
 __global__ void compact_flows_kernel(
     const GpuFlowSlot* __restrict__ slots,
-    int             table_size,
-    const int*  __restrict__ d_flags,
-    const int*  __restrict__ d_scan,          // exclusive prefix-sum of complete sizes
-    const uint8_t* __restrict__ payload_buf,
-    uint8_t*    out_buf,
-    int*        out_offsets,    // out_offsets[j] = start of flow j in out_buf
-    int*        out_num_flows   // total completed flows written
+    int                             table_size,
+    const int*         __restrict__ d_flags,
+    const int*         __restrict__ d_scan_bytes,  // exclusive prefix-sum of complete sizes
+    const uint8_t*     __restrict__ payload_buf,
+    uint8_t*                        out_buf
 ) {
     int i    = blockIdx.x * blockDim.x + threadIdx.x;
     int lane = threadIdx.x & 31;
@@ -418,25 +424,12 @@ __global__ void compact_flows_kernel(
     if (i >= table_size) return;
     if (!d_flags[i]) return;
 
-    // One warp handles one complete flow
-    int flow_j    = d_scan[i];       // output index (prefix sum over flags, not sizes)
-    int out_start = d_scan[i];       // reuse — but we need byte offset separately
+    int out_start = d_scan_bytes[i];
+    int src       = slots[i].buf_offset;
+    int nbytes    = slots[i].buf_capacity;
 
-    // We actually need two separate prefix sums: one over flags (flow index)
-    // and one over sizes (byte offset). compact_flows_kernel receives the size
-    // prefix sum (d_scan). The flow index is implicit (not needed here because
-    // we only fill out_buf bytes; out_offsets is written by the host after copyback).
-    const GpuFlowSlot* slot   = &slots[i];
-    int                src    = slot->buf_offset;
-    int                nbytes = slot->buf_capacity;
-
-    // Write payload bytes — all threads in the warp cooperate
     for (int b = lane; b < nbytes; b += 32)
         out_buf[out_start + b] = payload_buf[src + b];
-
-    // Lane 0 records the byte offset for this flow
-    if (lane == 0)
-        atomicMax(out_num_flows, flow_j + 1);  // track highest flow index seen
 }
 
 // ---------------------------------------------------------------------------
@@ -511,8 +504,8 @@ void run_gpu_reassembly(
     // Upload full input buffer
     size_t   input_len = (size_t)h_offsets[num_packets];
     uint8_t* d_input;
-    cudaMalloc(&d_input, input_len);
-    cudaMemcpy(d_input, h_input, input_len, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMalloc(&d_input, input_len));
+    CUDA_CHECK(cudaMemcpy(d_input, h_input, input_len, cudaMemcpyHostToDevice));
 
     // Upload SoA segment descriptors
     uint32_t *d_src_ip, *d_dst_ip, *d_seq;
@@ -520,25 +513,25 @@ void run_gpu_reassembly(
     uint8_t  *d_proto;
     int      *d_pay_off, *d_pay_len, *d_fin;
 
-    cudaMalloc(&d_src_ip,  num_segs * sizeof(uint32_t));
-    cudaMalloc(&d_dst_ip,  num_segs * sizeof(uint32_t));
-    cudaMalloc(&d_seq,     num_segs * sizeof(uint32_t));
-    cudaMalloc(&d_sport,   num_segs * sizeof(uint16_t));
-    cudaMalloc(&d_dport,   num_segs * sizeof(uint16_t));
-    cudaMalloc(&d_proto,   num_segs * sizeof(uint8_t));
-    cudaMalloc(&d_pay_off, num_segs * sizeof(int));
-    cudaMalloc(&d_pay_len, num_segs * sizeof(int));
-    cudaMalloc(&d_fin,     num_segs * sizeof(int));
+    CUDA_CHECK(cudaMalloc(&d_src_ip,  num_segs * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_dst_ip,  num_segs * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_seq,     num_segs * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_sport,   num_segs * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&d_dport,   num_segs * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&d_proto,   num_segs * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&d_pay_off, num_segs * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_pay_len, num_segs * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_fin,     num_segs * sizeof(int)));
 
-    cudaMemcpy(d_src_ip,  h_src_ip.data(),  num_segs * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dst_ip,  h_dst_ip.data(),  num_segs * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_seq,     h_seq.data(),     num_segs * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sport,   h_sport.data(),   num_segs * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dport,   h_dport.data(),   num_segs * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_proto,   h_proto.data(),   num_segs * sizeof(uint8_t),  cudaMemcpyHostToDevice);
-    cudaMemcpy(d_pay_off, h_pay_off.data(), num_segs * sizeof(int),      cudaMemcpyHostToDevice);
-    cudaMemcpy(d_pay_len, h_pay_len.data(), num_segs * sizeof(int),      cudaMemcpyHostToDevice);
-    cudaMemcpy(d_fin,     h_fin.data(),     num_segs * sizeof(int),      cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_src_ip,  h_src_ip.data(),  num_segs * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dst_ip,  h_dst_ip.data(),  num_segs * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_seq,     h_seq.data(),     num_segs * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sport,   h_sport.data(),   num_segs * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dport,   h_dport.data(),   num_segs * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_proto,   h_proto.data(),   num_segs * sizeof(uint8_t),  cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pay_off, h_pay_off.data(), num_segs * sizeof(int),      cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pay_len, h_pay_len.data(), num_segs * sizeof(int),      cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_fin,     h_fin.data(),     num_segs * sizeof(int),      cudaMemcpyHostToDevice));
 
     // ---- Step 3: allocate GPU flow table ----
     // Heuristic: at most num_segs distinct flows; cap at 64K flows.
@@ -565,18 +558,18 @@ void run_gpu_reassembly(
         ft.d_payload_buf, ft.d_payload_buf_top,
         ft.payload_buf_size
     );
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // ---- Step 5: mark complete flows ----
     int *d_flags, *d_sizes;
-    cudaMalloc(&d_flags, max_flows * sizeof(int));
-    cudaMalloc(&d_sizes, max_flows * sizeof(int));
+    CUDA_CHECK(cudaMalloc(&d_flags, max_flows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_sizes, max_flows * sizeof(int)));
 
     {
         int tb = 256;
         int gb = (max_flows + tb - 1) / tb;
         mark_complete_kernel<<<gb, tb>>>(ft.d_slots, max_flows, d_flags, d_sizes);
-        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     // ---- Step 6: prefix-sum scan over sizes (for byte offsets in out_buf) ----
@@ -587,13 +580,22 @@ void run_gpu_reassembly(
     //
     // Simple approach: multiply flags * sizes, then exclusive_scan.
     int *d_masked_sizes, *d_scan_bytes, *d_scan_flags;
-    cudaMalloc(&d_masked_sizes, max_flows * sizeof(int));
-    cudaMalloc(&d_scan_bytes,   max_flows * sizeof(int));
-    cudaMalloc(&d_scan_flags,   max_flows * sizeof(int));
+    CUDA_CHECK(cudaMalloc(&d_masked_sizes, max_flows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_scan_bytes,   max_flows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_scan_flags,   max_flows * sizeof(int)));
 
-    // Compute masked sizes (flags[i] * sizes[i]) — tiny kernel inline
+    auto cleanup = [&]() {
+        free_gpu_flow_table(ft);
+        cudaFree(d_flags);       cudaFree(d_sizes);
+        cudaFree(d_masked_sizes); cudaFree(d_scan_bytes); cudaFree(d_scan_flags);
+        cudaFree(d_input);
+        cudaFree(d_src_ip); cudaFree(d_dst_ip); cudaFree(d_seq);
+        cudaFree(d_sport);  cudaFree(d_dport);  cudaFree(d_proto);
+        cudaFree(d_pay_off); cudaFree(d_pay_len); cudaFree(d_fin);
+    };
+
+    // Compute masked sizes (flags[i] * sizes[i])
     {
-        // Use thrust transform for brevity
         thrust::device_ptr<int> tp_flags(d_flags);
         thrust::device_ptr<int> tp_sizes(d_sizes);
         thrust::device_ptr<int> tp_masked(d_masked_sizes);
@@ -611,28 +613,25 @@ void run_gpu_reassembly(
     int total_complete_bytes = 0, total_complete_flows = 0;
     {
         int last_flag, last_size, last_scan_b, last_scan_f;
-        cudaMemcpy(&last_flag,   d_flags       + max_flows - 1, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&last_size,   d_sizes       + max_flows - 1, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&last_scan_b, d_scan_bytes  + max_flows - 1, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&last_scan_f, d_scan_flags  + max_flows - 1, sizeof(int), cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(&last_flag,   d_flags      + max_flows - 1, sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&last_size,   d_sizes      + max_flows - 1, sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&last_scan_b, d_scan_bytes + max_flows - 1, sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&last_scan_f, d_scan_flags + max_flows - 1, sizeof(int), cudaMemcpyDeviceToHost));
         total_complete_bytes = last_scan_b + last_flag * last_size;
         total_complete_flows = last_scan_f + last_flag;
     }
 
     if (total_complete_flows == 0 || total_complete_bytes == 0) {
-        // No complete flows
         out_bytes.clear();
         out_offsets = {0};
-        goto cleanup;
+        cleanup();
+        return;
     }
 
     // ---- Step 7: compact_flows_kernel ----
     {
         uint8_t* d_out_buf;
-        int*     d_out_num;
-        cudaMalloc(&d_out_buf, (size_t)total_complete_bytes);
-        cudaMalloc(&d_out_num, sizeof(int));
-        cudaMemset(d_out_num, 0, sizeof(int));
+        CUDA_CHECK(cudaMalloc(&d_out_buf, (size_t)total_complete_bytes));
 
         int tb = 256;
         int gb = (max_flows + tb - 1) / tb;
@@ -640,18 +639,15 @@ void run_gpu_reassembly(
             ft.d_slots, max_flows,
             d_flags, d_scan_bytes,
             ft.d_payload_buf,
-            d_out_buf,
-            nullptr,   // out_offsets built on CPU below
-            d_out_num
+            d_out_buf
         );
-        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaDeviceSynchronize());
 
         // Copy reassembled bytes back to host
         out_bytes.resize((size_t)total_complete_bytes);
-        cudaMemcpy(out_bytes.data(), d_out_buf,
-                   (size_t)total_complete_bytes, cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(out_bytes.data(), d_out_buf,
+                              (size_t)total_complete_bytes, cudaMemcpyDeviceToHost));
         cudaFree(d_out_buf);
-        cudaFree(d_out_num);
     }
 
     // Build out_offsets on CPU from d_scan_bytes + d_flags (already on device;
@@ -659,10 +655,10 @@ void run_gpu_reassembly(
     {
         std::vector<int> h_scan_b(max_flows), h_scan_f(max_flows),
                          h_flags(max_flows),  h_sizes(max_flows);
-        cudaMemcpy(h_scan_b.data(), d_scan_bytes, max_flows * sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_scan_f.data(), d_scan_flags, max_flows * sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_flags.data(),  d_flags,      max_flows * sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_sizes.data(),  d_sizes,      max_flows * sizeof(int), cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(h_scan_b.data(), d_scan_bytes, max_flows * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_scan_f.data(), d_scan_flags, max_flows * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_flags.data(),  d_flags,      max_flows * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_sizes.data(),  d_sizes,      max_flows * sizeof(int), cudaMemcpyDeviceToHost));
 
         out_offsets.resize((size_t)total_complete_flows + 1, 0);
         for (int i = 0; i < max_flows; i++) {
@@ -671,17 +667,8 @@ void run_gpu_reassembly(
             out_offsets[flow_j]     = h_scan_b[i];
             out_offsets[flow_j + 1] = h_scan_b[i] + h_sizes[i];
         }
-        // Ensure sentinel is correct
         out_offsets[total_complete_flows] = total_complete_bytes;
     }
 
-cleanup:
-    // Free device resources
-    free_gpu_flow_table(ft);
-    cudaFree(d_flags);  cudaFree(d_sizes);
-    cudaFree(d_masked_sizes); cudaFree(d_scan_bytes); cudaFree(d_scan_flags);
-    cudaFree(d_input);
-    cudaFree(d_src_ip); cudaFree(d_dst_ip); cudaFree(d_seq);
-    cudaFree(d_sport);  cudaFree(d_dport);  cudaFree(d_proto);
-    cudaFree(d_pay_off); cudaFree(d_pay_len); cudaFree(d_fin);
+    cleanup();
 }

@@ -7,7 +7,7 @@
  * throughput alongside human-readable IDS alerts.
  *
  * Usage:
- *   ./ids --pcap PATH --rules PATH [--cpu | --gpu | --pfac | --both] [--reassemble]
+ *   ./ids --pcap PATH --rules PATH [--cpu | --gpu-naive | --pfac | --both] [--reassemble]
  *
  * Output:
  *   Loaded N packets (X MB), M patterns
@@ -18,14 +18,6 @@
  *   CPU throughput: 210.4 MB/s (47.3 ms)
  *
  * Exit code 0 on success, 1 on usage or I/O error.
- *
- * == Week 2 extension ==
- * Add --pfac flag to select the Aho-Corasick GPU kernel instead of naive.
- * The DFA build step (run once before the timed loop) goes here.
- *
- * == Week 4 extension ==
- * Add --replay-rate MB/s to throttle the benchmark and demonstrate CPU
- * dropping behind while the GPU keeps up.
  */
 
 #include "cpu_matcher.h"
@@ -55,23 +47,8 @@ static double elapsed_ms(
 }
 
 /** Walk the hits array and print one line per match. Returns total alert count. */
-static int print_alerts(const int* hits, int num_packets, const PatternSet& ps) {
-    int total = 0;
-    for (int p = 0; p < num_packets; p++) {
-        for (int r = 0; r < ps.num_patterns; r++) {
-            if (hits[p * ps.num_patterns + r]) {
-                std::cout << RED << "[ALERT]" << RESET
-                          << " packet #" << p
-                          << " | pattern \"" << ps.labels[r] << "\"\n";
-                total++;
-            }
-        }
-    }
-    std::cout << YELLOW << total << " alert(s) total" << RESET << "\n";
-    return total;
-}
-
-static int print_alerts(const uint8_t* hits, int num_packets, const PatternSet& ps) {
+template<typename T>
+static int print_alerts(const T* hits, int num_packets, const PatternSet& ps) {
     int total = 0;
     for (int p = 0; p < num_packets; p++) {
         for (int r = 0; r < ps.num_patterns; r++) {
@@ -89,7 +66,7 @@ static int print_alerts(const uint8_t* hits, int num_packets, const PatternSet& 
 
 int main(int argc, char** argv) {
     std::string pcap_path, rules_path;
-    bool do_cpu = false, do_gpu = false, do_pfac = false, do_reassemble = false;
+    bool do_cpu = false, do_gpu_naive = false, do_pfac = false, do_reassemble = false;
     bool do_flow_stats = false;
     bool do_web = false;
     int  web_port = 8080;
@@ -98,9 +75,9 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--pcap")        && i + 1 < argc) pcap_path  = argv[++i];
         if (!std::strcmp(argv[i], "--rules")       && i + 1 < argc) rules_path = argv[++i];
         if (!std::strcmp(argv[i], "--cpu"))         do_cpu = true;
-        if (!std::strcmp(argv[i], "--gpu"))         do_gpu = true;
+        if (!std::strcmp(argv[i], "--gpu-naive"))   do_gpu_naive = true;
         if (!std::strcmp(argv[i], "--pfac"))        do_pfac = true;
-        if (!std::strcmp(argv[i], "--both"))        { do_cpu = true; do_gpu = true; }
+        if (!std::strcmp(argv[i], "--both"))        { do_cpu = true; do_gpu_naive = true; }
         if (!std::strcmp(argv[i], "--reassemble"))  do_reassemble = true;
         if (!std::strcmp(argv[i], "--flow-stats"))  do_flow_stats = true;
         if (!std::strcmp(argv[i], "--web")) {
@@ -112,16 +89,15 @@ int main(int argc, char** argv) {
 
     // Web dashboard mode: serve the interactive UI, ignore --cpu/--gpu flags.
     if (do_web) {
-        std::cout << "CudaShield dashboard at http://cudashield.tech:" << web_port << "\n"
-                  << "  (also reachable locally at http://localhost:" << web_port << ")\n"
+        std::cout << "CudaShield dashboard at http://localhost:" << web_port << "\n"
                   << "Press Ctrl+C to stop.\n";
         run_web_server(web_port, pcap_path, rules_path);
         return 0;
     }
 
-    if (pcap_path.empty() || rules_path.empty() || (!do_cpu && !do_gpu && !do_pfac && !do_flow_stats)) {
+    if (pcap_path.empty() || rules_path.empty() || (!do_cpu && !do_gpu_naive && !do_pfac && !do_flow_stats)) {
         std::cerr << "Usage:\n"
-                  << "  ids --pcap PATH --rules PATH [--cpu | --gpu | --pfac | --both] [--reassemble] [--flow-stats]\n"
+                  << "  ids --pcap PATH --rules PATH [--cpu | --gpu-naive | --pfac | --both] [--reassemble] [--flow-stats]\n"
                   << "  ids --web [PORT] [--pcap PATH] [--rules PATH]\n";
         return 1;
     }
@@ -179,8 +155,8 @@ int main(int argc, char** argv) {
     if (ps.num_patterns > 1024) {
         std::cerr << "Warning: " << ps.num_patterns
                   << " patterns exceeds 1024 (GPU naive kernel limit).\n"
-                  << "Trim rules.txt or use --cpu only for now.\n";
-        if (do_gpu) return 1;
+                  << "Use --pfac or --cpu instead.\n";
+        if (do_gpu_naive) return 1;
     }
 
     std::vector<int>     hits(active.num_packets * ps.num_patterns, 0);
@@ -202,7 +178,7 @@ int main(int argc, char** argv) {
     }
 
     // -- GPU naive --
-    if (do_gpu) {
+    if (do_gpu_naive) {
         std::fill(hits.begin(), hits.end(), 0);
 
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -229,19 +205,18 @@ int main(int argc, char** argv) {
         std::vector<FlowStatResult> fstats;
         run_flow_stats_gpu(pcap, groups, fstats);
 
-        // Debug: print top 15 flows by packet count                                                    
-        std::sort(fstats.begin(), fstats.end(), [](const auto& a, const auto& b){
-            return a.packet_count > b.packet_count;                              
-        });                                                                                             
+        std::sort(fstats.begin(), fstats.end(), [](const auto& a, const auto& b) {
+            return a.packet_count > b.packet_count;
+        });
         for (int i = 0; i < std::min(15, (int)fstats.size()); i++) {
-            const auto& f = fstats[i];                                                                  
-            printf("  %u.%u.%u.%u → %u.%u.%u.%u:%u  pkts=%d  iat_cv=%.4f  iat_mean=%.1fms\n",           
-                (f.tuple.src_ip>>24)&0xFF, (f.tuple.src_ip>>16)&0xFF,                        
-                (f.tuple.src_ip>>8)&0xFF,   f.tuple.src_ip&0xFF,                                        
-                (f.tuple.dst_ip>>24)&0xFF, (f.tuple.dst_ip>>16)&0xFF,                                   
-                (f.tuple.dst_ip>>8)&0xFF,   f.tuple.dst_ip&0xFF,                                        
-                f.tuple.dport, f.packet_count, f.iat_cv, f.iat_mean_ms);                                
-        }   
+            const auto& f = fstats[i];
+            printf("  %u.%u.%u.%u -> %u.%u.%u.%u:%u  pkts=%d  iat_cv=%.4f  iat_mean=%.1fms\n",
+                (f.tuple.src_ip>>24)&0xFF, (f.tuple.src_ip>>16)&0xFF,
+                (f.tuple.src_ip>>8)&0xFF,  f.tuple.src_ip&0xFF,
+                (f.tuple.dst_ip>>24)&0xFF, (f.tuple.dst_ip>>16)&0xFF,
+                (f.tuple.dst_ip>>8)&0xFF,  f.tuple.dst_ip&0xFF,
+                f.tuple.dport, f.packet_count, f.iat_cv, f.iat_mean_ms);
+        }
         auto t1 = std::chrono::high_resolution_clock::now();
 
         int beacon_count = 0;
