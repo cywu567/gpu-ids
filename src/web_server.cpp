@@ -322,7 +322,7 @@ static std::string do_scan(const std::string& pcap_path,
             std::fill(pfac_hits.begin(), pfac_hits.end(), 0);
             PfacDfa dfa = build_pfac_dfa(ps);
             auto t0 = std::chrono::high_resolution_clock::now();
-            run_pfac_match_gpu_chunked(
+            run_pfac_match_gpu(
                 active.bytes.data(), active.offsets.data(), active.num_packets,
                 dfa, pfac_hits.data(), ps.num_patterns, active.bytes.size());
             auto t1 = std::chrono::high_resolution_clock::now();
