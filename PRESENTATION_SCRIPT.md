@@ -23,10 +23,11 @@ You give it a pcap capture and a rules file — the same format Snort uses.
 It scans every packet against every pattern simultaneously on the GPU, flags alerts,
 and shows throughput metrics in a live web dashboard.
 
-Three engines, all running side by side:
+Four engines, all running side by side:
 - **CPU baseline** — reference `memmem` sliding-window search
 - **GPU naive kernel** — brute force, one thread per (packet, pattern) pair
 - **GPU PFAC kernel** — Parallel Failureless Aho-Corasick, one thread per start byte
+- **Hyperscan (Vectorscan)** — Intel's production-grade SIMD CPU matcher, included as an industry baseline for comparison
 
 Plus a fourth component: **beacon detection** — a separate GPU kernel that catches
 C2 (command-and-control) malware that hides inside encrypted traffic where pattern matching
