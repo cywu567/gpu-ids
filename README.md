@@ -2,7 +2,7 @@
 
 A multi-pattern network packet scanner running on a consumer GPU. Scans pcap captures for known-bad byte signatures, in the style of Snort/Suricata but with the matching engine on a GPU instead of a CPU.
 
-Three matching engines: naive brute-force GPU kernel, PFAC Aho-Corasick GPU kernel with shared memory DFA cache, and Hyperscan (SIMD CPU) for comparison. Includes TCP flow reassembly to defeat split-payload evasion.
+Three matching engines: naive brute-force GPU kernel, PFAC Aho-Corasick GPU kernel, and Hyperscan (SIMD CPU) for comparison. Also includes GPU-parallel beacon detection via per-flow inter-arrival time statistics.
 
 ---
 
@@ -65,14 +65,10 @@ Then update `src/gen_synthetic.cpp` malicious payload strings to match your fina
 
 # CPU + GPU naive side by side
 ./build/ids --pcap data/demo.pcap --rules patterns/rules.txt --both
-
-# TCP reassembly then PFAC match (defeats split-payload evasion)
-./build/ids --pcap data/demo.pcap --rules patterns/rules.txt --pfac --reassemble
 ```
 
-`--gpu` uses the **naive** brute-force kernel (limited to 1 024 patterns).
+`--gpu-naive` uses the **naive** brute-force kernel (limited to 1 024 patterns).
 `--pfac` uses the **PFAC Aho-Corasick** kernel — no pattern limit, ~4 960 MB/s.
-`--reassemble` parses Ethernet/IP/TCP headers and stitches TCP streams before matching.
 
 ### Run benchmarks
 
@@ -240,9 +236,7 @@ gpu-ids/
     ├── gpu_matcher.cu/cuh      naive kernel + PFAC Aho-Corasick kernel
     │                             naive: one thread per (packet, pattern)
     │                             PFAC:  uint16_t DFA, uint8_t hits, ~4 960 MB/s
-    ├── flow_reassembly.cu/cuh  TCP stream reassembly
-    │                             CPU:  unordered_map flow table, gap buffering
-    │                             GPU:  atomicCAS hash table + thrust prefix-sum
+    ├── flow_stats.cu/cuh       GPU beacon detection (per-flow IAT statistics)
     ├── benchmark.cpp           timed runs; writes CSV
     ├── gen_synthetic.cpp       builds synthetic pcap with known hits
     ├── run_demo.cpp            CLI entry point (ids binary)
@@ -313,35 +307,6 @@ benchmark for direct comparison.
 
 ---
 
-## TCP flow reassembly
-
-An attacker can split a malicious payload across multiple TCP segments, each individually
-innocent. Without reassembly the matcher misses the pattern; with reassembly it sees the
-complete application stream.
-
-### CPU path (`reassemble_segment`)
-
-- Flow table: `std::unordered_map<FlowKey, FlowBuffer>` keyed by 5-tuple.
-- In-order segments are appended immediately; out-of-order segments are stashed in a
-  `std::map<uint32_t, bytes>` gap buffer keyed by sequence number.
-- When stashed segments become consecutive they are drained into the main buffer automatically.
-- On FIN or RST the completed stream is returned as a flat `std::vector<uint8_t>` and the
-  flow entry is removed.
-
-### GPU path (`flow_insert_kernel` + `mark_complete_kernel` + `compact_flows_kernel`)
-
-- Open-addressing hash table (`GpuFlowSlot[]`) lives on device.
-- One warp per segment: lane 0 drives `atomicCAS` linear probing to claim/find the flow's
-  slot; all 32 lanes cooperate to copy the payload at `buf_offset + (seq - init_seq)`,
-  which handles both in-order and out-of-order segments without CPU-side synchronization.
-- `mark_complete_kernel` flags slots where `fin_seen == 1`.
-- `compact_flows_kernel` uses `thrust::exclusive_scan` prefix-sum offsets to scatter
-  finished flows into a contiguous buffer fed directly into `run_pfac_match_gpu`.
-- Each flow's payload buffer is pre-allocated at a fixed `MAX_FLOW_BYTES`; flows exceeding
-  this are truncated.
-
----
-
 ## Demo script (90 seconds)
 
 1. "IDS systems check every packet against thousands of patterns. CPUs struggle at high speed. Enterprises pay $50k for FPGA appliances. We did it on a consumer GPU."
@@ -351,7 +316,7 @@ complete application stream.
 5. "Same alerts, Nx faster. That's the naive kernel -- one thread per (packet, pattern) pair."
 6. Benchmark all three: `./build/benchmark --pcap data/demo.pcap --rules patterns/rules.txt --iters 3 --pfac --hyperscan`
 7. "PFAC Aho-Corasick compiles all patterns into a single DFA -- one thread per start byte, O(packet_length) regardless of pattern count. ~5 GB/s vs Hyperscan's ~1.5 GB/s."
-8. "We also implemented TCP flow reassembly so split-payload evasion attacks don't fool us."
+8. "The beacon detection kernel groups flows by 5-tuple and computes IAT statistics on the GPU -- flagging C2 beacons that pattern matching alone can't see."
 
 ---
 

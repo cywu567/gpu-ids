@@ -21,7 +21,6 @@
 #include "httplib.h"
 
 #include "cpu_matcher.h"
-#include "flow_reassembly.cuh"
 #include "flow_stats.cuh"
 #include "gpu_matcher.cuh"
 #include "load_pcap.h"
@@ -54,9 +53,6 @@ struct ScanStatus {
     std::string error;
     int         num_packets = 0;
     int         num_patterns= 0;
-    bool        reassembled   = false;
-    int         num_streams   = 0;
-    double      reassemble_ms = 0;
     bool        cpu_done    = false;
     double      cpu_ms      = 0;
     double      cpu_mbps    = 0;
@@ -112,9 +108,6 @@ static std::string status_to_json() {
       << "  \"error\":" << '"' << json_esc(g_status.error) << '"' << ",\n"
       << "  \"num_packets\":" << g_status.num_packets << ",\n"
       << "  \"num_patterns\":" << g_status.num_patterns << ",\n"
-      << "  \"reassembled\":" << (g_status.reassembled ? "true" : "false") << ",\n"
-      << "  \"num_streams\":" << g_status.num_streams << ",\n"
-      << "  \"reassemble_ms\":" << g_status.reassemble_ms << ",\n"
       << "  \"cpu\":{"
           << "\"done\":" << (g_status.cpu_done ? "true" : "false") << ","
           << "\"ms\":"   << g_status.cpu_ms   << ","
@@ -209,7 +202,7 @@ static bool json_get_bool(const std::string& body, const std::string& key) {
 static std::string do_scan(const std::string& pcap_path,
                             const std::string& rules_path,
                             bool do_cpu, bool do_gpu, bool do_hs,
-                            bool do_reassemble, bool do_flow_stats)
+                            bool do_flow_stats)
 {
     // Mark scanning
     {
@@ -240,53 +233,14 @@ static std::string do_scan(const std::string& pcap_path,
             g_status.flow_stats_ms = ms_between(t0, t1);
         }
 
-        // Optional TCP reassembly — stitches TCP segments into full streams
-        // so split-payload evasion (pattern split across packets) is caught.
-        PcapData reassembled;
-        if (do_reassemble) {
-            auto t0 = std::chrono::high_resolution_clock::now();
-            for (int i = 0; i < pcap.num_packets; i++) {
-                int pkt_start = pcap.offsets[i];
-                int pkt_len   = pcap.offsets[i + 1] - pkt_start;
-                TcpSegment seg = parse_tcp_segment(
-                    pcap.bytes.data() + pkt_start, pkt_len);
-                if (!seg.valid) continue;
-                FlowBuffer* done = reassemble_segment(
-                    seg.key, seg.payload, seg.len, seg.seq, seg.fin);
-                if (done && !done->data.empty()) {
-                    reassembled.offsets.push_back((int)reassembled.bytes.size());
-                    reassembled.bytes.insert(reassembled.bytes.end(),
-                                             done->data.begin(), done->data.end());
-                    reassembled.num_packets++;
-                }
-            }
-            for (auto& fb : flush_all_flows()) {
-                if (fb.data.empty()) continue;
-                reassembled.offsets.push_back((int)reassembled.bytes.size());
-                reassembled.bytes.insert(reassembled.bytes.end(),
-                                          fb.data.begin(), fb.data.end());
-                reassembled.num_packets++;
-            }
-            reassembled.offsets.push_back((int)reassembled.bytes.size());
-            auto t1 = std::chrono::high_resolution_clock::now();
-            {
-                std::lock_guard<std::mutex> lk(g_mu);
-                g_status.reassembled   = true;
-                g_status.num_streams   = reassembled.num_packets;
-                g_status.reassemble_ms = ms_between(t0, t1);
-            }
-        }
+        double mb = static_cast<double>(pcap.bytes.size()) / 1e6;
 
-        const PcapData& active = do_reassemble ? reassembled : pcap;
-        double mb = static_cast<double>(active.bytes.size()) / 1e6;
-
-
-        std::vector<int>     hits(active.num_packets * ps.num_patterns, 0);
-        std::vector<uint8_t> pfac_hits(active.num_packets * ps.num_patterns, 0);
+        std::vector<int>     hits(pcap.num_packets * ps.num_patterns, 0);
+        std::vector<uint8_t> pfac_hits(pcap.num_packets * ps.num_patterns, 0);
 
         auto collect_alerts = [&](const std::string& mode) {
             bool use_pfac = (mode == "gpu");
-            for (int p = 0; p < active.num_packets; p++) {
+            for (int p = 0; p < pcap.num_packets; p++) {
                 for (int r = 0; r < ps.num_patterns; r++) {
                     int idx = p * ps.num_patterns + r;
                     int hit = use_pfac ? (int)pfac_hits[idx] : hits[idx];
@@ -305,8 +259,8 @@ static std::string do_scan(const std::string& pcap_path,
 
         if (do_cpu) {
             auto t0 = std::chrono::high_resolution_clock::now();
-            run_cpu_matcher(active.bytes.data(), active.offsets.data(),
-                            active.num_packets, ps, hits.data());
+            run_cpu_matcher(pcap.bytes.data(), pcap.offsets.data(),
+                            pcap.num_packets, ps, hits.data());
             auto t1 = std::chrono::high_resolution_clock::now();
             double ms = ms_between(t0, t1);
             {
@@ -323,8 +277,8 @@ static std::string do_scan(const std::string& pcap_path,
             PfacDfa dfa = build_pfac_dfa(ps);
             auto t0 = std::chrono::high_resolution_clock::now();
             run_pfac_match_gpu(
-                active.bytes.data(), active.offsets.data(), active.num_packets,
-                dfa, pfac_hits.data(), ps.num_patterns, active.bytes.size());
+                pcap.bytes.data(), pcap.offsets.data(), pcap.num_packets,
+                dfa, pfac_hits.data(), ps.num_patterns, pcap.bytes.size());
             auto t1 = std::chrono::high_resolution_clock::now();
             double ms = ms_between(t0, t1);
             {
@@ -345,7 +299,7 @@ static std::string do_scan(const std::string& pcap_path,
                 pats.push_back(ps.labels[r].c_str());
                 pat_lens.push_back(ps.labels[r].size());
                 ids.push_back(static_cast<unsigned>(r));
-                flags.push_back(HS_FLAG_CASELESS | HS_FLAG_SINGLEMATCH);
+                flags.push_back(HS_FLAG_SINGLEMATCH);
             }
             hs_database_t*      db  = nullptr;
             hs_compile_error_t* err = nullptr;
@@ -357,11 +311,11 @@ static std::string do_scan(const std::string& pcap_path,
                 hs_alloc_scratch(db, &scratch);
                 std::fill(hits.begin(), hits.end(), 0);
                 auto t0 = std::chrono::high_resolution_clock::now();
-                for (int p = 0; p < active.num_packets; p++) {
+                for (int p = 0; p < pcap.num_packets; p++) {
                     const char* pkt = reinterpret_cast<const char*>(
-                        active.bytes.data() + active.offsets[p]);
+                        pcap.bytes.data() + pcap.offsets[p]);
                     unsigned pkt_len = static_cast<unsigned>(
-                        active.offsets[p + 1] - active.offsets[p]);
+                        pcap.offsets[p + 1] - pcap.offsets[p]);
                     struct PktCtx { int p; int np; std::vector<int>* hits; };
                     PktCtx pctx{p, ps.num_patterns, &hits};
                     hs_scan(db, pkt, pkt_len, 0, scratch,
@@ -535,16 +489,10 @@ static const char* DASHBOARD_HTML = R"html(<!DOCTYPE html>
   </div>
   <div class="form-row">
     <label>Options</label>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <label style="color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:6px">
-        <input type="checkbox" id="reassemble-cb" style="accent-color:#58a6ff;cursor:pointer">
-        TCP reassembly (defeat split-payload evasion)
-      </label>
-      <label style="color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:6px">
-        <input type="checkbox" id="flow-stats-cb" style="accent-color:#58a6ff;cursor:pointer" checked>
-        Beacon detection (flow statistics)
-      </label>
-    </div>
+    <label style="color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:6px">
+      <input type="checkbox" id="flow-stats-cb" style="accent-color:#58a6ff;cursor:pointer" checked>
+      Beacon detection (flow statistics)
+    </label>
   </div>
   <div class="form-row" style="margin-top:6px">
     <button class="btn" id="scan-btn" onclick="startScan()">&#x25b6; Run Scan</button>
@@ -566,10 +514,6 @@ static const char* DASHBOARD_HTML = R"html(<!DOCTYPE html>
     <div class="stat-box">
       <span class="stat-label">Alerts</span>
       <span class="stat-value stat-alerts" id="s-alerts">—</span>
-    </div>
-    <div class="stat-box" id="streams-box" style="display:none">
-      <span class="stat-label">TCP Streams</span>
-      <span class="stat-value" style="color:#58a6ff" id="s-streams">—</span>
     </div>
     <div class="stat-box" id="speedup-box" style="display:none">
       <span class="stat-label">GPU vs CPU</span>
@@ -642,7 +586,6 @@ async function startScan() {
   const pcap       = document.getElementById('pcap-input').value.trim()  || 'data/test.pcap';
   const rules      = document.getElementById('rules-input').value.trim() || 'patterns/rules.txt';
   const mode        = document.querySelector('input[name=mode]:checked').value;
-  const reassemble  = document.getElementById('reassemble-cb').checked;
   const flow_stats  = document.getElementById('flow-stats-cb').checked;
 
   document.getElementById('scan-btn').disabled = true;
@@ -655,7 +598,7 @@ async function startScan() {
     const resp = await fetch('/api/scan', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({pcap, rules, mode, reassemble, flow_stats})
+      body: JSON.stringify({pcap, rules, mode, flow_stats})
     });
     const d = await resp.json();
     renderResults(d);
@@ -677,13 +620,6 @@ function renderResults(d) {
 
   document.getElementById('s-packets').textContent  = (d.num_packets  || 0).toLocaleString();
   document.getElementById('s-patterns').textContent = (d.num_patterns || 0).toLocaleString();
-
-  if (d.reassembled) {
-    document.getElementById('s-streams').textContent = (d.num_streams || 0).toLocaleString();
-    document.getElementById('streams-box').style.display = 'flex';
-  } else {
-    document.getElementById('streams-box').style.display = 'none';
-  }
 
   const alerts = d.alerts || [];
   document.getElementById('s-alerts').textContent = alerts.length;
@@ -829,10 +765,9 @@ void run_web_server(int port,
         bool do_cpu        = (mode == "cpu"  || mode == "both" || mode == "all" || mode.empty());
         bool do_gpu        = (mode == "gpu"  || mode == "both" || mode == "all" || mode.empty());
         bool do_hs         = (mode == "hyperscan" || mode == "all");
-        bool do_reassemble = json_get_bool(req.body, "reassemble");
         bool do_flow_stats = json_get_bool(req.body, "flow_stats");
 
-        std::string result = do_scan(pcap, rules, do_cpu, do_gpu, do_hs, do_reassemble, do_flow_stats);
+        std::string result = do_scan(pcap, rules, do_cpu, do_gpu, do_hs, do_flow_stats);
         res.set_content(result, "application/json");
     });
 

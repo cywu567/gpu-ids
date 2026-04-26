@@ -7,7 +7,7 @@
  * throughput alongside human-readable IDS alerts.
  *
  * Usage:
- *   ./ids --pcap PATH --rules PATH [--cpu | --gpu-naive | --pfac | --both] [--reassemble]
+ *   ./ids --pcap PATH --rules PATH [--cpu | --gpu-naive | --pfac | --both]
  *
  * Output:
  *   Loaded N packets (X MB), M patterns
@@ -21,7 +21,6 @@
  */
 
 #include "cpu_matcher.h"
-#include "flow_reassembly.cuh"
 #include "flow_stats.cuh"
 #include "gpu_matcher.cuh"
 #include "load_pcap.h"
@@ -66,7 +65,7 @@ static int print_alerts(const T* hits, int num_packets, const PatternSet& ps) {
 
 int main(int argc, char** argv) {
     std::string pcap_path, rules_path;
-    bool do_cpu = false, do_gpu_naive = false, do_pfac = false, do_reassemble = false;
+    bool do_cpu = false, do_gpu_naive = false, do_pfac = false;
     bool do_flow_stats = false;
     bool do_web = false;
     int  web_port = 8080;
@@ -78,7 +77,6 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--gpu-naive"))   do_gpu_naive = true;
         if (!std::strcmp(argv[i], "--pfac"))        do_pfac = true;
         if (!std::strcmp(argv[i], "--both"))        { do_cpu = true; do_gpu_naive = true; }
-        if (!std::strcmp(argv[i], "--reassemble"))  do_reassemble = true;
         if (!std::strcmp(argv[i], "--flow-stats"))  do_flow_stats = true;
         if (!std::strcmp(argv[i], "--web")) {
             do_web = true;
@@ -89,8 +87,8 @@ int main(int argc, char** argv) {
 
     // Web dashboard mode: serve the interactive UI, ignore --cpu/--gpu flags.
     if (do_web) {
-        std::cout << "CudaShield dashboard at http://cudashield.tech:" << web_port << "\n"
-                  << "  (also reachable locally at http://localhost:" << web_port << ")\n"
+        std::cout << "CudaShield dashboard at http://localhost:" << web_port << "\n"
+                  << "Public URL: https://cudashield.tech\n"
                   << "Press Ctrl+C to stop.\n";
         run_web_server(web_port, pcap_path, rules_path);
         return 0;
@@ -98,7 +96,7 @@ int main(int argc, char** argv) {
 
     if (pcap_path.empty() || rules_path.empty() || (!do_cpu && !do_gpu_naive && !do_pfac && !do_flow_stats)) {
         std::cerr << "Usage:\n"
-                  << "  ids --pcap PATH --rules PATH [--cpu | --gpu-naive | --pfac | --both] [--reassemble] [--flow-stats]\n"
+                  << "  ids --pcap PATH --rules PATH [--cpu | --gpu-naive | --pfac | --both] [--flow-stats]\n"
                   << "  ids --web [PORT] [--pcap PATH] [--rules PATH]\n";
         return 1;
     }
@@ -106,51 +104,8 @@ int main(int argc, char** argv) {
     PcapData   pcap = load_pcap(pcap_path);
     PatternSet ps   = load_patterns(rules_path);
 
-    // Optionally reassemble TCP flows before matching.
-    // CPU reassembly: iterate packets, parse TCP headers, stitch streams.
-    // The reassembled PcapData has one "packet" per completed TCP flow.
-    PcapData reassembled;
-    if (do_reassemble) {
-        auto t0 = std::chrono::high_resolution_clock::now();
-
-        // CPU path: parse and reassemble
-        for (int i = 0; i < pcap.num_packets; i++) {
-            int pkt_start = pcap.offsets[i];
-            int pkt_len   = pcap.offsets[i + 1] - pkt_start;
-            TcpSegment seg = parse_tcp_segment(
-                pcap.bytes.data() + pkt_start, pkt_len);
-            if (!seg.valid) continue;
-
-            FlowBuffer* done = reassemble_segment(
-                seg.key, seg.payload, seg.len, seg.seq, seg.fin);
-            if (done && !done->data.empty()) {
-                reassembled.offsets.push_back((int)reassembled.bytes.size());
-                reassembled.bytes.insert(reassembled.bytes.end(),
-                                         done->data.begin(), done->data.end());
-                reassembled.num_packets++;
-            }
-        }
-        // Drain flows without FIN (end of capture)
-        for (auto& fb : flush_all_flows()) {
-            if (fb.data.empty()) continue;
-            reassembled.offsets.push_back((int)reassembled.bytes.size());
-            reassembled.bytes.insert(reassembled.bytes.end(),
-                                      fb.data.begin(), fb.data.end());
-            reassembled.num_packets++;
-        }
-        reassembled.offsets.push_back((int)reassembled.bytes.size()); // sentinel
-
-        auto t1 = std::chrono::high_resolution_clock::now();
-        std::cout << YELLOW << "[reassemble] " << reassembled.num_packets
-                  << " TCP streams from " << pcap.num_packets << " packets ("
-                  << elapsed_ms(t0, t1) << " ms)" << RESET << "\n\n";
-    }
-
-    // Use reassembled streams if available, otherwise raw packets
-    const PcapData& active = do_reassemble ? reassembled : pcap;
-    double mb = static_cast<double>(active.bytes.size()) / 1e6;
-
-    std::cout << "Scanning " << active.num_packets << " units ("
+    double mb = static_cast<double>(pcap.bytes.size()) / 1e6;
+    std::cout << "Scanning " << pcap.num_packets << " packets ("
               << mb << " MB), " << ps.num_patterns << " patterns\n\n";
 
     if (ps.num_patterns > 1024) {
@@ -160,20 +115,20 @@ int main(int argc, char** argv) {
         if (do_gpu_naive) return 1;
     }
 
-    std::vector<int>     hits(active.num_packets * ps.num_patterns, 0);
-    std::vector<uint8_t> pfac_hits(active.num_packets * ps.num_patterns, 0);
+    std::vector<int>     hits(pcap.num_packets * ps.num_patterns, 0);
+    std::vector<uint8_t> pfac_hits(pcap.num_packets * ps.num_patterns, 0);
 
     // -- CPU --
     if (do_cpu) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        run_cpu_matcher(active.bytes.data(), active.offsets.data(),
-                        active.num_packets, ps, hits.data());
+        run_cpu_matcher(pcap.bytes.data(), pcap.offsets.data(),
+                        pcap.num_packets, ps, hits.data());
         auto t1  = std::chrono::high_resolution_clock::now();
         double ms   = elapsed_ms(t0, t1);
         double mbps = mb / (ms / 1e3);
 
         std::cout << "=== CPU results ===\n";
-        print_alerts(hits.data(), active.num_packets, ps);
+        print_alerts(hits.data(), pcap.num_packets, ps);
         std::cout << GREEN << "CPU throughput: " << mbps << " MB/s"
                   << RESET << " (" << ms << " ms)\n\n";
     }
@@ -184,17 +139,17 @@ int main(int argc, char** argv) {
 
         auto t0 = std::chrono::high_resolution_clock::now();
         run_naive_match_gpu(
-            active.bytes.data(),  active.offsets.data(),  active.num_packets,
-            ps.bytes.data(),      ps.offsets.data(),      ps.num_patterns,
+            pcap.bytes.data(),  pcap.offsets.data(),  pcap.num_packets,
+            ps.bytes.data(),    ps.offsets.data(),    ps.num_patterns,
             hits.data(),
-            active.bytes.size(),  ps.bytes.size()
+            pcap.bytes.size(),  ps.bytes.size()
         );
         auto t1  = std::chrono::high_resolution_clock::now();
         double ms   = elapsed_ms(t0, t1);
         double mbps = mb / (ms / 1e3);
 
         std::cout << "=== GPU (naive) results ===\n";
-        print_alerts(hits.data(), active.num_packets, ps);
+        print_alerts(hits.data(), pcap.num_packets, ps);
         std::cout << GREEN << "GPU naive throughput: " << mbps << " MB/s"
                   << RESET << " (" << ms << " ms)\n\n";
     }
@@ -263,15 +218,15 @@ int main(int argc, char** argv) {
 
         auto t0 = std::chrono::high_resolution_clock::now();
         run_pfac_match_gpu(
-            active.bytes.data(), active.offsets.data(), active.num_packets,
-            dfa, pfac_hits.data(), ps.num_patterns, active.bytes.size()
+            pcap.bytes.data(), pcap.offsets.data(), pcap.num_packets,
+            dfa, pfac_hits.data(), ps.num_patterns, pcap.bytes.size()
         );
         auto t1  = std::chrono::high_resolution_clock::now();
         double ms   = elapsed_ms(t0, t1);
         double mbps = mb / (ms / 1e3);
 
         std::cout << "=== GPU (PFAC) results ===\n";
-        print_alerts(pfac_hits.data(), active.num_packets, ps);
+        print_alerts(pfac_hits.data(), pcap.num_packets, ps);
         std::cout << GREEN << "GPU PFAC throughput: " << mbps << " MB/s"
                   << RESET << " (" << ms << " ms)\n\n";
     }

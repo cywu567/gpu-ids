@@ -30,7 +30,7 @@ static constexpr float BEACON_CV_THRESH = 0.15f;  // IAT CV below this → beaco
 static constexpr int   MIN_BEACON_PKTS  = 5;       // ignore tiny flows
 
 // ---------------------------------------------------------------------------
-// Five-tuple (standalone; mirrors FlowKey in flow_reassembly.cuh)
+// Five-tuple identifying a TCP/UDP flow
 // ---------------------------------------------------------------------------
 
 struct FSTuple {
