@@ -721,15 +721,21 @@ void run_web_server(int port,
                     const std::string& default_pcap,
                     const std::string& default_rules)
 {
-    // Warm up the CUDA context once at startup so the first timed scan
-    // doesn't include the ~200ms CUDA runtime initialization cost.
+    // Warm up the CUDA context and both kernel variants so the first timed
+    // scan doesn't include JIT compilation or cudaMalloc overhead.
     {
+        // 1. naive kernel: warms the CUDA context (~200ms driver init).
         const uint8_t dummy_input[1] = {0};
         const int     dummy_offsets[2] = {0, 1};
         int           dummy_hit[1] = {0};
         run_naive_match_gpu(dummy_input, dummy_offsets, 1,
                             dummy_input, dummy_offsets, 1,
                             dummy_hit, 1, 1);
+
+        // 2. PFAC kernel: JIT-compiles pfac_kernel, pre-allocates the
+        //    persistent buffer cache, and uploads the DFA so every
+        //    subsequent scan skips both allocation and DFA transfer.
+        pfac_gpu_warmup(load_patterns(default_rules));
     }
 
     // Patch the default values into the HTML at startup.

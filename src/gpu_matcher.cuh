@@ -124,4 +124,16 @@ void run_pfac_match_gpu(
     size_t         input_len
 );
 
+/**
+ * Warm up the persistent GPU buffer cache for PFAC.
+ *
+ * Builds the DFA from ps, pre-allocates all device buffers at the right sizes,
+ * uploads the DFA, and fires a 1-packet dummy kernel launch to force JIT
+ * compilation of pfac_kernel.  After this returns, timed scans with the same
+ * rule set incur zero allocation and zero DFA-upload overhead.
+ *
+ * Call once at startup, before the first real scan.
+ */
+void pfac_gpu_warmup(const PatternSet& ps);
+
 // ---------------------------------------------------------------------------
