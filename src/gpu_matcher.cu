@@ -288,6 +288,70 @@ __global__ void pfac_kernel_smem(
 }
 
 // ---------------------------------------------------------------------------
+// PFAC kernel — chunked 2D grid (fixes underutilization with few large streams)
+// ---------------------------------------------------------------------------
+
+/**
+ * Same DFA walk as pfac_kernel_smem, but uses a 2D grid so that large streams
+ * get multiple blocks rather than one.
+ *
+ * Grid:  blockIdx.x = stream index, blockIdx.y = chunk index
+ * Block: threadIdx.x = starting byte within the chunk
+ *
+ * Each block covers starting positions [chunk_start, chunk_start+chunk_size).
+ * The inner DFA walk still runs to the end of the stream so no match is missed.
+ * Blocks whose chunk_start >= stream_len return immediately (idle overhead only).
+ *
+ * Multiple blocks for the same stream can write to the same hits byte, but
+ * every such write sets it to 1, so concurrent same-value byte stores are safe.
+ */
+__global__ void pfac_kernel_smem_chunked(
+    const uint8_t*  __restrict__ input,
+    const int*      __restrict__ packet_offsets,
+    int                          num_packets,
+    const uint16_t* __restrict__ dfa_table,
+    const int*      __restrict__ accepting,
+    uint8_t*                     hits,
+    int                          num_patterns,
+    int                          smem_states,
+    int                          chunk_size
+) {
+    extern __shared__ uint16_t s_dfa[];
+
+    int load_elems = smem_states * 256;
+    for (int i = (int)threadIdx.x; i < load_elems; i += (int)blockDim.x)
+        s_dfa[i] = __ldg(&dfa_table[i]);
+    __syncthreads();
+
+    int stream_id   = blockIdx.x;
+    int chunk_start = blockIdx.y * chunk_size;
+    if (stream_id >= num_packets) return;
+
+    int pkt_start = packet_offsets[stream_id];
+    int pkt_len   = packet_offsets[stream_id + 1] - pkt_start;
+
+    if (chunk_start >= pkt_len) return;
+
+    int chunk_end = chunk_start + chunk_size;
+    if (chunk_end > pkt_len) chunk_end = pkt_len;
+
+    for (int start = chunk_start + (int)threadIdx.x; start < chunk_end; start += (int)blockDim.x) {
+        int state = 1;
+        for (int pos = start; pos < pkt_len; pos++) {
+            unsigned char c = input[pkt_start + pos];
+            state = (state < smem_states)
+                  ? (int)s_dfa[state * 256 + c]
+                  : (int)__ldg(&dfa_table[state * 256 + c]);
+            if (state == 0) break;
+
+            int pat = __ldg(&accepting[state]);
+            if (pat != 0)
+                hits[stream_id * num_patterns + (pat - 1)] = 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Host-side launcher: PFAC shared-memory variant
 // ---------------------------------------------------------------------------
 
@@ -376,6 +440,69 @@ void run_pfac_match_gpu(
         d_input, d_offsets, num_packets,
         d_dfa_table, d_accepting,
         d_hits, num_patterns
+    );
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_hits, d_hits,
+               (size_t)num_packets * num_patterns * sizeof(uint8_t),
+               cudaMemcpyDeviceToHost);
+
+    cudaFree(d_input);
+    cudaFree(d_offsets);
+    cudaFree(d_dfa_table);
+    cudaFree(d_accepting);
+    cudaFree(d_hits);
+}
+
+// ---------------------------------------------------------------------------
+// Host-side launcher: chunked 2D grid (smem DFA + chunk parallelism)
+// ---------------------------------------------------------------------------
+
+void run_pfac_match_gpu_chunked(
+    const uint8_t* h_input,
+    const int*     h_offsets,
+    int            num_packets,
+    const PfacDfa& dfa,
+    uint8_t*       h_hits,
+    int            num_patterns,
+    size_t         input_len
+) {
+    uint8_t*  d_input;
+    int       *d_offsets, *d_accepting;
+    uint16_t* d_dfa_table;
+    uint8_t*  d_hits;
+
+    cudaMalloc(&d_input,     input_len);
+    cudaMalloc(&d_offsets,   (num_packets + 1) * sizeof(int));
+    cudaMalloc(&d_dfa_table, (size_t)dfa.num_states * 256 * sizeof(uint16_t));
+    cudaMalloc(&d_accepting, (size_t)dfa.num_states * sizeof(int));
+    cudaMalloc(&d_hits,      (size_t)num_packets * num_patterns * sizeof(uint8_t));
+
+    cudaMemcpy(d_input,     h_input,              input_len,                                       cudaMemcpyHostToDevice);
+    cudaMemcpy(d_offsets,   h_offsets,            (num_packets + 1) * sizeof(int),                 cudaMemcpyHostToDevice);
+    cudaMemcpy(d_dfa_table, dfa.table.data(),     (size_t)dfa.num_states * 256 * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_accepting, dfa.accepting.data(), (size_t)dfa.num_states * sizeof(int),            cudaMemcpyHostToDevice);
+    cudaMemset(d_hits, 0,   (size_t)num_packets * num_patterns * sizeof(uint8_t));
+
+    const int THREADS    = 256;
+    const int CHUNK      = 4096;
+    const int SMEM_BYTES = 48 * 1024;
+    int smem_states = std::min(dfa.num_states, SMEM_BYTES / (256 * (int)sizeof(uint16_t)));
+    size_t smem_size = (size_t)smem_states * 256 * sizeof(uint16_t);
+
+    int max_stream_len = 0;
+    for (int i = 0; i < num_packets; i++) {
+        int len = h_offsets[i + 1] - h_offsets[i];
+        if (len > max_stream_len) max_stream_len = len;
+    }
+    int max_chunks = (max_stream_len + CHUNK - 1) / CHUNK;
+    if (max_chunks < 1) max_chunks = 1;
+
+    dim3 grid(num_packets, max_chunks);
+    pfac_kernel_smem_chunked<<<grid, THREADS, smem_size>>>(
+        d_input, d_offsets, num_packets,
+        d_dfa_table, d_accepting,
+        d_hits, num_patterns, smem_states, CHUNK
     );
     cudaDeviceSynchronize();
 
