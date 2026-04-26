@@ -30,7 +30,7 @@ PASSWORD=
 api_key=
 
 # Executable in HTTP traffic (PE header = .exe being downloaded)
-MZ
+# MZ
 
 # Old IE User-Agent — faked by malware since ~2014, no legitimate browser uses it
 User-Agent: Mozilla/4.0 (compatible; MSIE
