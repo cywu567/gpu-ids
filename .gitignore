@@ -7,3 +7,7 @@ data/synthetic_large*.pcap
 data/synthetic_30mb.pcap
 data/demo.pcap
 pcap-tshark-analysis/
+data/2025-06-13-traffic-analysis-exercise.pcap
+data/2026-01-31-traffic-analysis-exercise.pcap
+data/2026-02-28-traffic-analysis-exercise.pcap
+data/synthetic_beacon.pcap
