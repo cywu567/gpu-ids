@@ -1,5 +1,8 @@
 .claude/
 build/
+gpu-ids-project.md
+hackathon-plan.md
+PRESENTATION_SCRIPT.md
 results/
 data/*.pcap
 pcap-tshark-analysis/
