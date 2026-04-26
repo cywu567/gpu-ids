@@ -231,12 +231,6 @@ static std::string do_scan(const std::string& pcap_path,
             FlowGrouping groups = group_flows_by_5tuple(pcap);
             std::vector<FlowStatResult> fstats;
             run_flow_stats_gpu(pcap, groups, fstats);
-
-            int dbg_beacons = 0;
-            for (const auto& f : fstats) if (f.is_beacon) ++dbg_beacons;
-            std::fprintf(stderr, "[flow_stats] num_flows=%d  beacons=%d  pcap_pkts=%d\n",
-                         groups.num_flows, dbg_beacons, pcap.num_packets);
-
             std::lock_guard<std::mutex> lk(g_mu);
             g_status.flow_stats = std::move(fstats);
         }
