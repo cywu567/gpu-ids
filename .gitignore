@@ -1,13 +1,5 @@
 .claude/
 build/
 results/
-data/synthetic_6*.pcap
-data/synthetic_1*.pcap 
-data/synthetic_large*.pcap
-data/synthetic_30mb.pcap
-data/demo.pcap
+data/*.pcap
 pcap-tshark-analysis/
-data/2025-06-13-traffic-analysis-exercise.pcap
-data/2026-01-31-traffic-analysis-exercise.pcap
-data/2026-02-28-traffic-analysis-exercise.pcap
-data/synthetic_beacon.pcap
