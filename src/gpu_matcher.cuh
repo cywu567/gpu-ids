@@ -8,17 +8,17 @@
  *
  * Kernel inventory:
  *
- *   run_naive_match_gpu  (hackathon weekend)
+ *   run_naive_match_gpu  (naive baseline)
  *     One CUDA block per packet, one thread per pattern. Each thread does a
  *     brute-force sliding-window search. Grid config: <<<num_packets, num_patterns>>>.
  *     num_patterns must be <= 1024 (CUDA max threads per block).
- *     Intentionally unoptimized -- this is the punching bag.
+ *     Intentionally unoptimized -- this is the performance baseline.
  *
- *   run_pfac_match_gpu   (class project Week 2 + Week 3 -- implemented)
+ *   run_pfac_match_gpu   (PFAC Aho-Corasick)
  *     Parallel Failureless Aho-Corasick: one thread per (packet, start_offset)
  *     pair. Each thread walks the DFA forward from its assigned byte position
  *     until it reaches a dead state. Requires a pre-built DFA table.
- *     Week 3: hot DFA states cached in shared memory (up to 48 KB = 96 states),
+ *     Hot DFA states cached in shared memory (up to 48 KB = 96 states),
  *     falling back to __ldg for deep states. Entire DFA fits for typical rule sets.
  *     Reference: Lin, Liu, Chang (2013) IEEE Trans. Computers.
  */
@@ -47,7 +47,7 @@ struct Hit {
  * @param num_packets      Number of packets.
  * @param h_patterns       Flat pattern bytes on host (PatternSet::bytes.data()).
  * @param h_pat_offsets    Pattern offset array on host (length num_patterns+1).
- * @param num_patterns     Number of patterns. Must be <= 1024 this weekend.
+ * @param num_patterns     Number of patterns. Must be <= 1024 (CUDA max threads per block).
  * @param h_hits           Output: caller-allocated int array of size
  *                         (num_packets * num_patterns), zero-initialized on device.
  *                         h_hits[p * num_patterns + r] = 1 on match.
@@ -67,7 +67,7 @@ void run_naive_match_gpu(
 );
 
 // ---------------------------------------------------------------------------
-// PFAC Aho-Corasick kernel (class project Week 2)
+// PFAC Aho-Corasick kernel
 // ---------------------------------------------------------------------------
 
 /**
@@ -120,6 +120,26 @@ void run_pfac_match_gpu(
     int            num_packets,
     const PfacDfa& dfa,
     uint8_t*       h_hits,       // uint8_t: 1/4 the PCIe bandwidth of int
+    int            num_patterns,
+    size_t         input_len
+);
+
+/**
+ * Chunked 2D grid PFAC matcher — fixes GPU underutilization when processing
+ * a small number of large streams (e.g. TCP reassembly output).
+ *
+ * Grid: dim3(num_packets, max_chunks) where max_chunks = ceil(max_stream_len / CHUNK).
+ * Each block handles starting positions within an 8 KB slice of one stream.
+ * For raw packets (< 8 KB) max_chunks == 1, so cost is identical to a 1D grid.
+ * Uses __ldg + L2 cache instead of shared memory — the DFA (~100 KB) fits
+ * in L2, so smem loading (48 KB × num_blocks) would cost more than it saves.
+ */
+void run_pfac_match_gpu_chunked(
+    const uint8_t* h_input,
+    const int*     h_offsets,
+    int            num_packets,
+    const PfacDfa& dfa,
+    uint8_t*       h_hits,
     int            num_patterns,
     size_t         input_len
 );

@@ -231,6 +231,12 @@ static std::string do_scan(const std::string& pcap_path,
             FlowGrouping groups = group_flows_by_5tuple(pcap);
             std::vector<FlowStatResult> fstats;
             run_flow_stats_gpu(pcap, groups, fstats);
+
+            int dbg_beacons = 0;
+            for (const auto& f : fstats) if (f.is_beacon) ++dbg_beacons;
+            std::fprintf(stderr, "[flow_stats] num_flows=%d  beacons=%d  pcap_pkts=%d\n",
+                         groups.num_flows, dbg_beacons, pcap.num_packets);
+
             std::lock_guard<std::mutex> lk(g_mu);
             g_status.flow_stats = std::move(fstats);
         }
@@ -275,10 +281,6 @@ static std::string do_scan(const std::string& pcap_path,
         const PcapData& active = do_reassemble ? reassembled : pcap;
         double mb = static_cast<double>(active.bytes.size()) / 1e6;
 
-        // Touch all bytes to warm OS page cache before timed runs.
-        volatile uint8_t sink = 0;
-        for (const auto& b : active.bytes) sink ^= b;
-        (void)sink;
 
         std::vector<int>     hits(active.num_packets * ps.num_patterns, 0);
         std::vector<uint8_t> pfac_hits(active.num_packets * ps.num_patterns, 0);
@@ -321,7 +323,7 @@ static std::string do_scan(const std::string& pcap_path,
             std::fill(pfac_hits.begin(), pfac_hits.end(), 0);
             PfacDfa dfa = build_pfac_dfa(ps);
             auto t0 = std::chrono::high_resolution_clock::now();
-            run_pfac_match_gpu(
+            run_pfac_match_gpu_chunked(
                 active.bytes.data(), active.offsets.data(), active.num_packets,
                 dfa, pfac_hits.data(), ps.num_patterns, active.bytes.size());
             auto t1 = std::chrono::high_resolution_clock::now();

@@ -67,7 +67,7 @@ add_executable(gen_synthetic src/gen_synthetic.cpp)
 target_link_libraries(gen_synthetic ${PCAP_LIB})
 
 # ---------------------------------------------------------------------------
-# Week 3: flow reassembly
+# Flow reassembly
 # ---------------------------------------------------------------------------
 target_sources(ids       PRIVATE src/flow_reassembly.cu)
 target_sources(benchmark PRIVATE src/flow_reassembly.cu)

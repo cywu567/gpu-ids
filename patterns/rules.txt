@@ -1,12 +1,10 @@
 # GPU-IDS pattern rules file
 # One pattern per line. Blank lines and lines starting with '#' are ignored.
-# These are broad HTTP/exploit indicators to start. After picking a malware
-# pcap, open it in Wireshark, find the HTTP streams, and add specific URLs,
-# User-Agent strings, and payload bytes you observe in the traffic.
+# These are broad HTTP/exploit indicators. Add specific URLs, User-Agent
+# strings, and payload bytes observed in target traffic.
 #
-# Keep this list under 1024 entries for the hackathon weekend -- the naive
-# kernel launches one thread per pattern and CUDA caps threads-per-block at
-# 1024. The class project PFAC kernel removes this constraint.
+# Note: the naive GPU kernel requires <= 1024 patterns (CUDA max threads/block).
+# The PFAC kernel has no such limit.
 
 # -- Directory traversal / LFI --
 GET /cgi-bin/

@@ -18,12 +18,6 @@
  *     set title 'CPU vs GPU throughput (MB/s)';
  *     plot 'results/benchmark.csv' using 1:4 with linespoints
  *   "
- *
- * == Class project extensions ==
- * Week 2: add a --pfac mode that times the Aho-Corasick kernel, including
- *         the one-time DFA build cost reported separately.
- * Week 4: add --hyperscan mode (conditional on Hyperscan being available at
- *         link time) for the head-to-head comparison in the report.
  */
 
 #include "cpu_matcher.h"
@@ -181,7 +175,7 @@ int main(int argc, char** argv) {
             pats.push_back(ps.labels[r].c_str());
             pat_lens.push_back(ps.labels[r].size());
             ids.push_back(static_cast<unsigned>(r));
-            flags.push_back(HS_FLAG_CASELESS | HS_FLAG_SINGLEMATCH);
+            flags.push_back(HS_FLAG_SINGLEMATCH);
         }
         hs_database_t* db   = nullptr;
         hs_compile_error_t* err = nullptr;
@@ -230,8 +224,6 @@ int main(int argc, char** argv) {
     if (run_hyperscan)
         std::cerr << "Hyperscan/Vectorscan not compiled in (rebuild with vectorscan in conda env).\n";
 #endif
-
-    // TODO (Week 4): add Hyperscan mode
 
     return 0;
 }

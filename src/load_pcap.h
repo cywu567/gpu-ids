@@ -9,11 +9,8 @@
  * contiguous allocation, which is what both the CPU matcher (random access)
  * and the GPU kernel launcher (single cudaMemcpy) need. No protocol parsing
  * is done here -- all packet bytes including Ethernet/IP/TCP headers are
- * kept as-is and searched verbatim.
- *
- * Weekend hackathon: flat buffer + offsets, no flow tracking.
- * Class project Week 3: flow_reassembly.cu sits on top of this, grouping
- * packets by 5-tuple before they reach the matcher.
+ * kept as-is and searched verbatim. For TCP stream-level matching,
+ * flow_reassembly.cu groups packets by 5-tuple before they reach the matcher.
  */
 
 #pragma once

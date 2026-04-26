@@ -6,14 +6,9 @@
  * Every hit the GPU reports should appear in the CPU hit array and vice
  * versa. Any disagreement is a bug in the GPU kernel, not the CPU code.
  *
- * The hackathon weekend implementation uses memmem (POSIX) for simplicity:
- * for each packet, for each pattern, search once and record a hit.
- * Runtime is O(num_packets * num_patterns * avg_packet_len) -- intentionally
- * naive so the GPU speedup story is honest.
- *
- * Class project Week 1: replace with a proper Aho-Corasick CPU implementation
- * (or wrap the ac-automata library) so the CPU baseline is competitive and
- * the comparison against Hyperscan is fair.
+ * Uses memmem (POSIX) for simplicity: for each packet, for each pattern,
+ * search once and record a hit. Runtime is O(num_packets * num_patterns *
+ * avg_packet_len) -- intentionally naive so the GPU speedup story is honest.
  */
 
 #pragma once
