@@ -1,5 +1,7 @@
 # gpu-ids: GPU-Accelerated Intrusion Detection System
 
+**Authors:** Simone Shevchuk, Celine Wu
+
 A multi-pattern network packet scanner running on a consumer GPU. Scans pcap captures for known-bad byte signatures, in the style of Snort/Suricata but with the matching engine on a GPU instead of a CPU.
 
 Three matching engines: naive brute-force GPU kernel, PFAC Aho-Corasick GPU kernel, and Hyperscan (SIMD CPU) for comparison. Also includes GPU-parallel beacon detection via per-flow inter-arrival time statistics.
@@ -29,7 +31,7 @@ is already present on shared GPU clusters):
 nvcc --version   # verify
 ```
 
-macOS has no NVIDIA GPU -- use [Google Colab](https://colab.research.google.com/) (T4 free tier) or the Caltech CS179 cluster.
+macOS has no NVIDIA GPU -- use [Google Colab](https://colab.research.google.com/) (T4 free tier) or a remote GPU cluster.
 
 ### Build
 
@@ -304,19 +306,6 @@ in ~4 cycles and cannot be evicted mid-kernel.
 `run_pfac_match_gpu` uses the `__ldg`-only kernel (default). The shared-memory variant is
 exposed as `run_pfac_match_gpu_smem` and accessible via `--pfac-baseline` in the
 benchmark for direct comparison.
-
----
-
-## Demo script (90 seconds)
-
-1. "IDS systems check every packet against thousands of patterns. CPUs struggle at high speed. Enterprises pay $50k for FPGA appliances. We did it on a consumer GPU."
-2. Show the pcap: `ls -lh data/demo.pcap`
-3. CPU: `./build/ids --pcap data/demo.pcap --rules patterns/rules.txt --cpu`
-4. GPU naive: `./build/ids --pcap data/demo.pcap --rules patterns/rules.txt --gpu`
-5. "Same alerts, Nx faster. That's the naive kernel -- one thread per (packet, pattern) pair."
-6. Benchmark all three: `./build/benchmark --pcap data/demo.pcap --rules patterns/rules.txt --iters 3 --pfac --hyperscan`
-7. "PFAC Aho-Corasick compiles all patterns into a single DFA -- one thread per start byte, O(packet_length) regardless of pattern count. ~5 GB/s vs Hyperscan's ~1.5 GB/s."
-8. "The beacon detection kernel groups flows by 5-tuple and computes IAT statistics on the GPU -- flagging C2 beacons that pattern matching alone can't see."
 
 ---
 

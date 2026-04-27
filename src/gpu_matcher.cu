@@ -43,6 +43,37 @@
 #include <cstring>
 
 // ---------------------------------------------------------------------------
+// Persistent GPU buffer cache  (grow-only, never shrinks)
+//
+// Eliminates cudaMalloc/cudaFree on every scan.  Buffers are reallocated only
+// when a new scan requests more bytes than the current capacity.
+//
+// DFA (rules) buffers are re-uploaded only when num_states changes, since the
+// trie topology is uniquely determined by the pattern file content.  If you
+// serve two different rule files that happen to produce the same num_states
+// you would get a stale DFA -- fine for this demo where rules are fixed.
+// ---------------------------------------------------------------------------
+struct PfacGpuCache {
+    uint8_t*  d_input      = nullptr;  size_t cap_input      = 0;
+    int*      d_offsets    = nullptr;  size_t cap_offsets    = 0;
+    uint16_t* d_dfa_table  = nullptr;  size_t cap_dfa_table  = 0;
+    int*      d_accepting  = nullptr;  size_t cap_accepting  = 0;
+    uint8_t*  d_hits       = nullptr;  size_t cap_hits       = 0;
+    int       dfa_num_states = -1;  // cache tag: -1 = never loaded
+};
+static PfacGpuCache g_pfac;
+
+// Grow a device buffer in-place if the needed size exceeds capacity.
+template<typename T>
+static void gpu_ensure(T*& ptr, size_t& cap, size_t needed) {
+    if (needed > cap) {
+        cudaFree(ptr);          // no-op when ptr == nullptr
+        cudaMalloc(&ptr, needed);
+        cap = needed;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Naive kernel
 // ---------------------------------------------------------------------------
 
@@ -299,22 +330,26 @@ void run_pfac_match_gpu_smem(
     int            num_patterns,
     size_t         input_len
 ) {
-    uint8_t*  d_input;
-    int       *d_offsets, *d_accepting;
-    uint16_t* d_dfa_table;
-    uint8_t*  d_hits;
+    size_t dfa_table_bytes = (size_t)dfa.num_states * 256 * sizeof(uint16_t);
+    size_t accepting_bytes = (size_t)dfa.num_states * sizeof(int);
+    size_t offsets_bytes   = (size_t)(num_packets + 1) * sizeof(int);
+    size_t hits_bytes      = (size_t)num_packets * num_patterns * sizeof(uint8_t);
 
-    cudaMalloc(&d_input,     input_len);
-    cudaMalloc(&d_offsets,   (num_packets + 1) * sizeof(int));
-    cudaMalloc(&d_dfa_table, (size_t)dfa.num_states * 256 * sizeof(uint16_t));
-    cudaMalloc(&d_accepting, (size_t)dfa.num_states * sizeof(int));
-    cudaMalloc(&d_hits,      (size_t)num_packets * num_patterns * sizeof(uint8_t));
+    gpu_ensure(g_pfac.d_input,     g_pfac.cap_input,     input_len);
+    gpu_ensure(g_pfac.d_offsets,   g_pfac.cap_offsets,   offsets_bytes);
+    gpu_ensure(g_pfac.d_hits,      g_pfac.cap_hits,      hits_bytes);
+    gpu_ensure(g_pfac.d_dfa_table, g_pfac.cap_dfa_table, dfa_table_bytes);
+    gpu_ensure(g_pfac.d_accepting, g_pfac.cap_accepting, accepting_bytes);
 
-    cudaMemcpy(d_input,     h_input,              input_len,                                       cudaMemcpyHostToDevice);
-    cudaMemcpy(d_offsets,   h_offsets,            (num_packets + 1) * sizeof(int),                 cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dfa_table, dfa.table.data(),     (size_t)dfa.num_states * 256 * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_accepting, dfa.accepting.data(), (size_t)dfa.num_states * sizeof(int),            cudaMemcpyHostToDevice);
-    cudaMemset(d_hits, 0,   (size_t)num_packets * num_patterns * sizeof(uint8_t));
+    cudaMemcpy(g_pfac.d_input,   h_input,   input_len,     cudaMemcpyHostToDevice);
+    cudaMemcpy(g_pfac.d_offsets, h_offsets, offsets_bytes, cudaMemcpyHostToDevice);
+    cudaMemset(g_pfac.d_hits, 0, hits_bytes);
+
+    if (dfa.num_states != g_pfac.dfa_num_states) {
+        cudaMemcpy(g_pfac.d_dfa_table, dfa.table.data(),     dfa_table_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(g_pfac.d_accepting, dfa.accepting.data(), accepting_bytes,  cudaMemcpyHostToDevice);
+        g_pfac.dfa_num_states = dfa.num_states;
+    }
 
     const int THREADS    = 256;
     // Fit as many DFA rows as possible into 48 KB of shared memory.
@@ -323,21 +358,14 @@ void run_pfac_match_gpu_smem(
     size_t smem_size     = (size_t)smem_states * 256 * sizeof(uint16_t);
 
     pfac_kernel_smem<<<num_packets, THREADS, smem_size>>>(
-        d_input, d_offsets, num_packets,
-        d_dfa_table, d_accepting,
-        d_hits, num_patterns, smem_states
+        g_pfac.d_input, g_pfac.d_offsets, num_packets,
+        g_pfac.d_dfa_table, g_pfac.d_accepting,
+        g_pfac.d_hits, num_patterns, smem_states
     );
     cudaDeviceSynchronize();
 
-    cudaMemcpy(h_hits, d_hits,
-               (size_t)num_packets * num_patterns * sizeof(uint8_t),
-               cudaMemcpyDeviceToHost);
-
-    cudaFree(d_input);
-    cudaFree(d_offsets);
-    cudaFree(d_dfa_table);
-    cudaFree(d_accepting);
-    cudaFree(d_hits);
+    cudaMemcpy(h_hits, g_pfac.d_hits, hits_bytes, cudaMemcpyDeviceToHost);
+    // Buffers are retained -- reused next call.
 }
 
 // ---------------------------------------------------------------------------
@@ -353,39 +381,47 @@ void run_pfac_match_gpu(
     int            num_patterns,
     size_t         input_len
 ) {
-    uint8_t*  d_input;
-    int       *d_offsets, *d_accepting;
-    uint16_t* d_dfa_table;
-    uint8_t*  d_hits;
+    size_t dfa_table_bytes = (size_t)dfa.num_states * 256 * sizeof(uint16_t);
+    size_t accepting_bytes = (size_t)dfa.num_states * sizeof(int);
+    size_t offsets_bytes   = (size_t)(num_packets + 1) * sizeof(int);
+    size_t hits_bytes      = (size_t)num_packets * num_patterns * sizeof(uint8_t);
 
-    cudaMalloc(&d_input,     input_len);
-    cudaMalloc(&d_offsets,   (num_packets + 1) * sizeof(int));
-    cudaMalloc(&d_dfa_table, (size_t)dfa.num_states * 256 * sizeof(uint16_t));
-    cudaMalloc(&d_accepting, (size_t)dfa.num_states * sizeof(int));
-    cudaMalloc(&d_hits,      (size_t)num_packets * num_patterns * sizeof(uint8_t));
+    gpu_ensure(g_pfac.d_input,     g_pfac.cap_input,     input_len);
+    gpu_ensure(g_pfac.d_offsets,   g_pfac.cap_offsets,   offsets_bytes);
+    gpu_ensure(g_pfac.d_hits,      g_pfac.cap_hits,      hits_bytes);
+    gpu_ensure(g_pfac.d_dfa_table, g_pfac.cap_dfa_table, dfa_table_bytes);
+    gpu_ensure(g_pfac.d_accepting, g_pfac.cap_accepting, accepting_bytes);
 
-    cudaMemcpy(d_input,     h_input,              input_len,                                       cudaMemcpyHostToDevice);
-    cudaMemcpy(d_offsets,   h_offsets,            (num_packets + 1) * sizeof(int),                 cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dfa_table, dfa.table.data(),     (size_t)dfa.num_states * 256 * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_accepting, dfa.accepting.data(), (size_t)dfa.num_states * sizeof(int),            cudaMemcpyHostToDevice);
-    cudaMemset(d_hits, 0,   (size_t)num_packets * num_patterns * sizeof(uint8_t));
+    cudaMemcpy(g_pfac.d_input,   h_input,   input_len,     cudaMemcpyHostToDevice);
+    cudaMemcpy(g_pfac.d_offsets, h_offsets, offsets_bytes, cudaMemcpyHostToDevice);
+    cudaMemset(g_pfac.d_hits, 0, hits_bytes);
+
+    if (dfa.num_states != g_pfac.dfa_num_states) {
+        cudaMemcpy(g_pfac.d_dfa_table, dfa.table.data(),     dfa_table_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(g_pfac.d_accepting, dfa.accepting.data(), accepting_bytes,  cudaMemcpyHostToDevice);
+        g_pfac.dfa_num_states = dfa.num_states;
+    }
 
     const int THREADS = 256;
     pfac_kernel<<<num_packets, THREADS>>>(
-        d_input, d_offsets, num_packets,
-        d_dfa_table, d_accepting,
-        d_hits, num_patterns
+        g_pfac.d_input, g_pfac.d_offsets, num_packets,
+        g_pfac.d_dfa_table, g_pfac.d_accepting,
+        g_pfac.d_hits, num_patterns
     );
     cudaDeviceSynchronize();
 
-    cudaMemcpy(h_hits, d_hits,
-               (size_t)num_packets * num_patterns * sizeof(uint8_t),
-               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_hits, g_pfac.d_hits, hits_bytes, cudaMemcpyDeviceToHost);
+    // Buffers are retained -- reused next call.
+}
 
-    cudaFree(d_input);
-    cudaFree(d_offsets);
-    cudaFree(d_dfa_table);
-    cudaFree(d_accepting);
-    cudaFree(d_hits);
+void pfac_gpu_warmup(const PatternSet& ps) {
+    PfacDfa dfa = build_pfac_dfa(ps);
+    // One-packet dummy scan: JIT-compiles the kernel, pre-allocates cache
+    // buffers at DFA-appropriate sizes, and uploads the DFA so subsequent
+    // real scans skip the DFA transfer entirely.
+    const uint8_t  w_in[1]  = {0};
+    const int      w_off[2] = {0, 1};
+    std::vector<uint8_t> w_hit((size_t)ps.num_patterns, 0);
+    run_pfac_match_gpu(w_in, w_off, 1, dfa, w_hit.data(), ps.num_patterns, 1);
 }
 
