@@ -31,7 +31,7 @@ is already present on shared GPU clusters):
 nvcc --version   # verify
 ```
 
-macOS has no NVIDIA GPU -- use [Google Colab](https://colab.research.google.com/) (T4 free tier) or the Caltech CS179 cluster.
+macOS has no NVIDIA GPU -- use [Google Colab](https://colab.research.google.com/) (T4 free tier) or a remote GPU cluster.
 
 ### Build
 
